@@ -1,0 +1,6 @@
+# Recording output (created when the collector runs)
+data/
+
+# Build output
+bin/
+*.exe
