@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/algoboy-kevin/go-collector/pkg/libs"
 	connector "github.com/algoboy-kevin/go-exchange-connector"
 )
 
@@ -31,11 +33,24 @@ const (
 	FeedEventBinanceBookTkr  = "binance_book_ticker" // connector.BinanceBookTickerEvent
 	FeedEventBinanceAggTrade = "binance_agg_trade"   // connector.BinanceAggTradeEvent
 	FeedEventBinanceDepth    = "binance_depth"       // connector.BinanceDepthEvent
+	FeedEventBinanceKline    = "binance_kline"       // connector.BinanceKlineEvent (final candles only)
 )
 
 // feedFlushEvery is how many records to buffer before flushing the gzip
 // stream, so a crash mid-bucket still leaves recoverable data.
 const feedFlushEvery = 512
+
+// DefaultFeedPartBytes is how large one bucket part may grow before the recorder
+// starts another one.
+//
+// A single epoch bucket holds a day of aggTrade + top-20 depth, which at full
+// load runs to hundreds of MB compressed — an awkward thing to scp, to open, or
+// to lose to one write error. Parts are therefore cut at this size and listed in
+// the bucket's metadata.json (`parts`); the first keeps the documented name
+// events.gz and the rest are events.001.gz, events.002.gz, …, so `events*.gz`
+// sorted is the whole stream in order and a reader that opens only events.gz
+// still works on any bucket that never rotated.
+const DefaultFeedPartBytes = 256 << 20 // 256 MiB compressed
 
 // feedDropLogInterval throttles "queue full, dropping events" warnings.
 const feedDropLogInterval = 5 * time.Second
@@ -53,32 +68,43 @@ type feedItem struct {
 // FeedRecorder streams a continuous reference-price feed (RTDS or Binance) to
 // disk in hourly buckets, decoupled from prediction-market rotation:
 //
-//	{root}/[{SOURCE}_]{SYMBOL}_{hourStartUnix}/
+//	{root}/[{market}/]{prefix}{symbol}_{epochID}/
 //	    events.gz       ← gzip JSONL of RecordedEvent (mixed event types)
 //	    metadata.json   ← FeedMetadata (bucket window, counts, feed info)
+//
+// The market directory is what keeps binance spot and perp apart: both can
+// record the same symbol (BTCUSDT), and without it they would open the same
+// events.gz and truncate each other.
 //
 // The chainlink_twap source gets a "chainlink_twap_" prefix because it shares
 // the RTDS root with FeedSourceRTDS and would otherwise collide with the same
 // symbol recorded as a reference price (e.g. btc/usd TWAP vs btc/usd).
 //
-// Buckets are cut at wall-clock hour boundaries so folders/files stay small.
-// Unlike market sessions (buffered then written once at finalize), a feed
-// recorder streams events to the current bucket as they arrive — required
-// because Binance feeds are continuous and high-volume (trades + partial
-// book depth at up to 10/s) and would be too large to hold in memory.
+// Buckets are cut at **epoch** boundaries (libs.EpochAnchor) so a feed file
+// lines up with the market day it belongs to and with data/market/<epoch>/
+// (see CONTEXT.md §5). Like market sessions, a feed recorder streams events to
+// the current bucket as they arrive, so memory stays flat regardless of volume.
 type FeedRecorder struct {
-	root   string // e.g. "data/rtds" or "data/binance"
-	symbol string // e.g. "btcusdt" / "BTCUSDT"
-	source string // FeedSourceRTDS or FeedSourceBinance
-	market string // binance market ("spot"/"perp"), empty for rtds
+	root   string           // e.g. "data/rtds" or "data/binance"
+	symbol string           // e.g. "btcusdt" / "BTCUSDT"
+	source string           // FeedSourceRTDS or FeedSourceBinance
+	market string           // binance market ("spot"/"perp"), empty for rtds
+	anchor libs.EpochAnchor // daily epoch boundary rule
 
 	mu          sync.Mutex
 	closed      bool
-	bucketName  string
-	bucketStart time.Time
+	bucketName  string    // folder name, e.g. "btcusdt_2026-10-02"
+	bucketEpoch string    // epoch id of the open bucket (ET date, YYYY-MM-DD)
+	bucketStart time.Time // epoch start
+	bucketEnd   time.Time // epoch end == settle instant of the epoch
 	f           *os.File
 	gw          *gzip.Writer
 	enc         *json.Encoder
+
+	// Part rotation: the events of one bucket may span several files (see
+	// DefaultFeedPartBytes). partNames is what metadata.json lists.
+	partLimit int64
+	partNames []string
 
 	// recCh buffers events between the dispatcher goroutine (Record) and the
 	// writer goroutine, so heavy feed encoding (esp. binance depth) never runs
@@ -108,17 +134,37 @@ type FeedRecorder struct {
 
 // NewFeedRecorder creates a feed recorder rooted at root (e.g. "data/rtds").
 // symbol is the asset symbol, source is FeedSourceRTDS or FeedSourceBinance,
-// and market is the binance market ("spot"/"perp") or empty for rtds.
-func NewFeedRecorder(root, symbol, source, market string) *FeedRecorder {
+// market is the binance market ("spot"/"perp") or empty for rtds, and anchor
+// is the daily epoch rule the buckets are cut on.
+func NewFeedRecorder(root, symbol, source, market string, anchor libs.EpochAnchor) *FeedRecorder {
+	if !anchor.Valid() {
+		panic(fmt.Sprintf("collector: NewFeedRecorder needs a daily epoch anchor, got %q", anchor))
+	}
 	return &FeedRecorder{
 		root:       root,
 		symbol:     symbol,
+		anchor:     anchor,
 		source:     source,
 		market:     market,
+		partLimit:  DefaultFeedPartBytes,
 		typeCounts: make(map[string]int64),
 		recCh:      make(chan feedItem, 8192),
 		stopCh:     make(chan struct{}),
 	}
+}
+
+// SetPartLimit overrides how large a bucket part may grow before the recorder
+// starts another (0 or negative = one file per bucket, the pre-rotation layout).
+// Call it before Start: it is not safe to change once events are being written.
+func (f *FeedRecorder) SetPartLimit(bytes int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.bucketName != "" {
+		slog.Warn("feed: ignoring a part-limit change on an open bucket",
+			"feed", f.source, "symbol", f.symbol)
+		return
+	}
+	f.partLimit = bytes
 }
 
 // Start launches a background ticker that keeps the open bucket's
@@ -209,12 +255,28 @@ func (f *FeedRecorder) drain() {
 }
 
 // ensureBucketOpenLocked opens the bucket if none is open (first event),
-// without rotating on hour change — rotation is handled by the writer
-// goroutine (writeOne) so queued items always land in their own hour's bucket.
+// without rotating on an epoch change — rotation is handled by the writer
+// goroutine (writeOne) so queued items always land in their own epoch's bucket.
 func (f *FeedRecorder) ensureBucketOpenLocked(ts time.Time) {
 	if f.bucketStart.IsZero() {
-		f.openBucketLocked(ts.Truncate(time.Hour))
+		f.openBucketLocked(ts)
 	}
+}
+
+// bucketRoot is the directory the bucket folders live under: {root}/{market}
+// for binance feeds (so spot and perp cannot collide), {root} otherwise.
+func (f *FeedRecorder) bucketRoot() string {
+	if f.market == "" {
+		return f.root
+	}
+	return filepath.Join(f.root, f.market)
+}
+
+// epochBucket returns the epoch id containing ts and its bounds.
+func (f *FeedRecorder) epochBucket(ts time.Time) (id string, start, end time.Time) {
+	id = libs.EpochIDAt(ts, f.anchor)
+	start, end, _ = libs.EpochBounds(id, f.anchor) // anchor validated at construction
+	return id, start, end
 }
 
 // writeOne marshals and encodes a single queued feed event, updating bucket
@@ -281,6 +343,98 @@ func (f *FeedRecorder) writeOne(item feedItem) {
 	if f.count%feedFlushEvery == 0 && f.gw != nil {
 		_ = f.gw.Flush() // durability: recoverable up to this point on crash
 	}
+	f.rotateIfFullLocked()
+}
+
+// partFileName is the file name of part i: the documented events.gz first, then
+// events.001.gz, events.002.gz, …
+//
+// Keeping events.gz for the first part means a bucket that never rotates is
+// byte-for-byte the file it always was, so existing readers keep working. It
+// also means a plain glob is NOT the read order — "events.001.gz" sorts ahead of
+// "events.gz" — so the order is events.gz followed by the numbered parts in
+// numeric order, which is exactly what metadata.json's `parts` list records.
+func partFileName(i int) string {
+	if i <= 0 {
+		return "events.gz"
+	}
+	return fmt.Sprintf("events.%03d.gz", i)
+}
+
+// rotateIfFullLocked starts a new part once the open one has reached the size
+// limit. Caller holds f.mu.
+//
+// The size is the file's own offset, i.e. the COMPRESSED bytes already on disk —
+// that is what a download and a reader have to cope with. gzip spills its
+// internal buffer as it fills, so the offset tracks the stream closely, and the
+// periodic flush above marks a hard point every feedFlushEvery records.
+func (f *FeedRecorder) rotateIfFullLocked() {
+	if f.partLimit <= 0 || f.f == nil {
+		return
+	}
+	off, err := f.f.Seek(0, io.SeekCurrent)
+	if err != nil || off < f.partLimit {
+		return
+	}
+	dir := filepath.Join(f.bucketRoot(), f.bucketName)
+	name := partFileName(len(f.partNames))
+	if err := f.closePartLocked(); err != nil {
+		slog.Error("feed: closing a full part failed", "path", filepath.Join(dir, name), "err", err)
+	}
+	if err := f.openPartLocked(dir); err != nil {
+		slog.Error("feed: opening the next part failed", "dir", dir, "limit", f.partLimit, "err", err)
+		return
+	}
+	slog.Info("feed: rotated bucket part",
+		"feed", f.source,
+		"symbol", f.symbol,
+		"bucket", f.bucketName,
+		"part", f.partNames[len(f.partNames)-1],
+		"bytes", off,
+	)
+}
+
+// closePartLocked flushes and closes the open part, leaving f.enc nil. Caller
+// holds f.mu.
+func (f *FeedRecorder) closePartLocked() error {
+	if f.enc == nil {
+		return nil
+	}
+	if f.gw != nil {
+		if err := f.gw.Close(); err != nil {
+			_ = f.f.Close()
+			f.gw, f.f, f.enc = nil, nil, nil
+			return err
+		}
+	}
+	err := f.f.Close()
+	f.gw, f.f, f.enc = nil, nil, nil
+	return err
+}
+
+// openPartLocked creates the next part file inside dir and starts streaming into
+// it, appending its name to the bucket's part list. Caller holds f.mu.
+func (f *FeedRecorder) openPartLocked(dir string) error {
+	name := partFileName(len(f.partNames))
+	path := filepath.Join(dir, name)
+
+	fh, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	gw, err := gzip.NewWriterLevel(fh, gzip.BestSpeed)
+	if err != nil {
+		_ = fh.Close()
+		return err
+	}
+	enc := json.NewEncoder(gw)
+	enc.SetEscapeHTML(false)
+
+	f.f = fh
+	f.gw = gw
+	f.enc = enc
+	f.partNames = append(f.partNames, name)
+	return nil
 }
 
 // FeedHealth is a snapshot of a feed recorder's liveness, used by the
@@ -376,17 +530,17 @@ func (f *FeedRecorder) Record(ev any) bool {
 }
 
 // tick runs periodically (from Start). It refreshes the open bucket's
-// metadata.json (so metadata survives even a hard kill) and closes the
-// bucket once the wall-clock hour advances (leaving it closed; the next
-// event reopens the new hour's bucket).
+// metadata.json (so metadata survives even a hard kill) and closes the bucket
+// once the epoch advances (leaving it closed; the next event reopens the new
+// epoch's bucket).
 func (f *FeedRecorder) tick(now time.Time) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.bucketStart.IsZero() {
 		return
 	}
-	hour := now.Truncate(time.Hour)
-	if hour.After(f.bucketStart) {
+	id, _, _ := f.epochBucket(now)
+	if id > f.bucketEpoch { // only ever rotate forwards
 		f.closeBucketLocked()
 		return
 	}
@@ -401,61 +555,55 @@ func (f *FeedRecorder) writeOpenBucketMetadataLocked() {
 		return
 	}
 	meta := f.buildFeedMetadataLocked()
-	if err := writeMetadata(f.root, f.bucketName, meta); err != nil {
-		slog.Error("feed: metadata write failed", "dir", f.root, "bucket", f.bucketName, "err", err)
+	if err := writeMetadata(f.bucketRoot(), f.bucketName, meta); err != nil {
+		slog.Error("feed: metadata write failed", "dir", f.bucketRoot(), "bucket", f.bucketName, "err", err)
 	}
 }
 
-// ensureBucketLocked opens/rotates to the bucket containing ts.
+// ensureBucketLocked opens/rotates to the epoch bucket containing ts.
 func (f *FeedRecorder) ensureBucketLocked(ts time.Time) {
 	if ts.IsZero() {
 		ts = time.Now()
 	}
-	hour := ts.Truncate(time.Hour)
+	id, _, _ := f.epochBucket(ts)
 
 	if !f.bucketStart.IsZero() {
-		if hour.Before(f.bucketStart) {
-			hour = f.bucketStart // out-of-order arrival — stay in current bucket
-		}
-		if hour.Equal(f.bucketStart) {
+		// Epoch ids are YYYY-MM-DD, so they compare lexically. A late event from
+		// an already-closed epoch stays in the current bucket rather than
+		// reopening history.
+		if id <= f.bucketEpoch {
 			return
 		}
 		f.closeBucketLocked()
 	}
-	f.openBucketLocked(hour)
+	f.openBucketLocked(ts)
 }
 
-// openBucketLocked creates {root}/[{SOURCE}_]{SYMBOL}_{hourStartUnix}/events.gz
-// and starts streaming into it.
-func (f *FeedRecorder) openBucketLocked(hour time.Time) {
-	name := fmt.Sprintf("%s%s_%d", bucketPrefix(f.source), bucketSymbol(f.symbol), hour.Unix())
-	dir := filepath.Join(f.root, name)
+// openBucketLocked creates {root}/[{market}/]{prefix}{symbol}_{epochID}/ and
+// starts streaming into its first part.
+func (f *FeedRecorder) openBucketLocked(ts time.Time) {
+	epochID, start, end := f.epochBucket(ts)
+	name := fmt.Sprintf("%s%s_%s", bucketPrefix(f.source), bucketSymbol(f.symbol), epochID)
+	dir := filepath.Join(f.bucketRoot(), name)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		slog.Error("feed: mkdir failed", "dir", dir, "err", err)
 		return
 	}
 
-	path := filepath.Join(dir, "events.gz")
-	fh, err := os.Create(path)
-	if err != nil {
-		slog.Error("feed: create failed", "path", path, "err", err)
-		return
-	}
-	gw, err := gzip.NewWriterLevel(fh, gzip.BestSpeed)
-	if err != nil {
-		slog.Error("feed: gzip failed", "path", path, "err", err)
-		fh.Close()
-		return
-	}
-
-	enc := json.NewEncoder(gw)
-	enc.SetEscapeHTML(false)
-
 	f.bucketName = name
-	f.bucketStart = hour
-	f.f = fh
-	f.gw = gw
-	f.enc = enc
+	f.bucketEpoch = epochID
+	f.bucketStart = start
+	f.bucketEnd = end
+	f.partNames = nil
+	if err := f.openPartLocked(dir); err != nil {
+		slog.Error("feed: create failed", "dir", dir, "err", err)
+		f.bucketName = ""
+		f.bucketEpoch = ""
+		f.bucketStart = time.Time{}
+		f.bucketEnd = time.Time{}
+		return
+	}
+
 	f.count = 0
 	f.typeCounts = make(map[string]int64)
 	f.firstTs = 0
@@ -474,27 +622,25 @@ func (f *FeedRecorder) openBucketLocked(hour time.Time) {
 		"feed", f.source,
 		"symbol", f.symbol,
 		"bucket", name,
-		"path", path,
+		"path", filepath.Join(dir, f.partNames[0]),
 	)
 }
 
-// closeBucketLocked flushes the current bucket and writes its metadata.json.
+// closeBucketLocked flushes the current part and writes the bucket's
+// metadata.json.
 func (f *FeedRecorder) closeBucketLocked() {
-	if f.enc == nil {
+	if f.bucketName == "" {
 		return
 	}
 
 	name := f.bucketName
-	if f.gw != nil {
-		_ = f.gw.Close()
-	}
-	if f.f != nil {
-		_ = f.f.Close()
+	if err := f.closePartLocked(); err != nil {
+		slog.Error("feed: closing the last part failed", "bucket", name, "err", err)
 	}
 
 	meta := f.buildFeedMetadataLocked()
-	if err := writeMetadata(f.root, name, meta); err != nil {
-		slog.Error("feed: metadata write failed", "dir", f.root, "bucket", name, "err", err)
+	if err := writeMetadata(f.bucketRoot(), name, meta); err != nil {
+		slog.Error("feed: metadata write failed", "dir", f.bucketRoot(), "bucket", name, "err", err)
 	}
 
 	slog.Info("feed: closed bucket",
@@ -502,13 +648,14 @@ func (f *FeedRecorder) closeBucketLocked() {
 		"symbol", f.symbol,
 		"bucket", name,
 		"events", f.count,
+		"parts", len(f.partNames),
 	)
 
 	f.bucketName = ""
+	f.bucketEpoch = ""
 	f.bucketStart = time.Time{}
-	f.f = nil
-	f.gw = nil
-	f.enc = nil
+	f.bucketEnd = time.Time{}
+	f.partNames = nil
 	f.count = 0
 	f.typeCounts = make(map[string]int64)
 	f.firstTs = 0
@@ -560,8 +707,8 @@ func (f *FeedRecorder) buildFeedMetadataLocked() *FeedMetadata {
 		}
 	}
 	tailStale := int64(0)
-	if f.count > 0 && f.lastTs > 0 {
-		tailStale = f.bucketStart.Add(time.Hour).UnixMilli() - f.lastTs
+	if f.count > 0 && f.lastTs > 0 && !f.bucketEnd.IsZero() {
+		tailStale = f.bucketEnd.UnixMilli() - f.lastTs
 		if tailStale < 0 {
 			tailStale = 0
 		}
@@ -571,8 +718,11 @@ func (f *FeedRecorder) buildFeedMetadataLocked() *FeedMetadata {
 		Feed:         f.source,
 		Symbol:       f.symbol,
 		Market:       f.market,
+		Parts:        append([]string(nil), f.partNames...),
+		EpochID:      f.bucketEpoch,
+		Anchor:       string(f.anchor),
 		StartTime:    f.bucketStart.UnixMilli(),
-		EndTime:      f.bucketStart.Add(time.Hour).UnixMilli(),
+		EndTime:      f.bucketEnd.UnixMilli(),
 		EventCount:   f.count,
 		EventCounts:  f.typeCounts,
 		FirstEventTs: f.firstTs,
@@ -599,6 +749,14 @@ func feedEventMeta(ev any) (typ string, ts, receivedAt time.Time, seqID int64, o
 		return FeedEventBinanceAggTrade, e.Timestamp, e.ReceivedAt, e.SeqID, true
 	case *connector.BinanceDepthEvent:
 		return FeedEventBinanceDepth, e.Timestamp, e.ReceivedAt, e.SeqID, true
+	case *connector.BinanceKlineEvent:
+		// Binance pushes an update for the in-progress candle every second, all
+		// of them redundant with the trade stream. Only the closed candle — the
+		// one that can be cross-checked against aggTrade — is worth a row.
+		if !e.IsFinal {
+			return "", time.Time{}, time.Time{}, 0, false
+		}
+		return FeedEventBinanceKline, e.Timestamp, e.ReceivedAt, e.SeqID, true
 	}
 	return "", time.Time{}, time.Time{}, 0, false
 }

@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/algoboy-kevin/go-collector/pkg/libs"
-	"github.com/algoboy-kevin/go-collector/pkg/services/runtime"
-	"github.com/algoboy-kevin/go-des/pkg/abstract"
 	connector "github.com/algoboy-kevin/go-exchange-connector"
 )
 
@@ -33,9 +33,16 @@ type EventCollector struct {
 	mu       sync.RWMutex
 	sessions map[string]*RecordingSession // marketID → session
 	assetMap map[string]string            // assetID → marketID
+	// conditionMap and negRiskMap are the other two ways a resolution can name
+	// a market: by its Gamma condition id, and by the shared neg-risk group id.
+	// The market WS sends `id` and `market` (the condition id), and for a
+	// neg-risk event that id can be the *group* id rather than the rung's market
+	// id — without these maps such a rung would never resolve and would be
+	// truncated at shutdown instead (CONTEXT.md §13.2).
+	conditionMap map[string]string   // conditionID → marketID
+	negRiskMap   map[string][]string // negRiskMarketID → marketIDs
 
 	cfg  CollectorConfig
-	rt   *runtime.RuntimeManager     // for cron routine scheduling
 	conn connector.ExchangeConnector // for WS subscription management
 
 	// Continuous feed recorders (RTDS / Binance), keyed by feedKey.
@@ -44,25 +51,35 @@ type EventCollector struct {
 	// feedHealth tracks the previous stale state per feed (monitor goroutine).
 	feedHealth map[string]bool
 
+	// truncatedMarkets remembers markets this run ended before their settlement.
+	// StopAll drops finalized sessions from the routing map, so the epoch
+	// manifest asks here rather than scanning sessions that no longer exist.
+	truncatedMarkets map[string]bool
+
+	// spotBits carries the latest reference price of the underlying asset
+	// (math.Float64bits), read by the ladder strike filter.
+	spotBits atomic.Uint64
+
 	connEvents   []ConnectionEvent
 	connEventsMu sync.Mutex
 }
 
-// NewCollector creates a new EventCollector with the given RuntimeManager
-// and PolymarketConnector. The RuntimeManager is used for cron scheduling;
-// the connector is used to subscribe/unsubscribe asset IDs on the WS.
-func NewCollector(cfg CollectorConfig, rt *runtime.RuntimeManager, conn connector.ExchangeConnector) *EventCollector {
+// NewCollector creates a new EventCollector with the given connector. The
+// connector is used to subscribe/unsubscribe asset IDs on the WS.
+func NewCollector(cfg CollectorConfig, conn connector.ExchangeConnector) *EventCollector {
 	if cfg.RecordingDir == "" {
 		cfg.RecordingDir = DefaultRecordingDir
 	}
 	return &EventCollector{
-		sessions:      make(map[string]*RecordingSession),
-		assetMap:      make(map[string]string),
-		feedRecorders: make(map[string]*FeedRecorder),
-		feedHealth:    make(map[string]bool),
-		cfg:           cfg,
-		rt:            rt,
-		conn:          conn,
+		sessions:         make(map[string]*RecordingSession),
+		assetMap:         make(map[string]string),
+		conditionMap:     make(map[string]string),
+		negRiskMap:       make(map[string][]string),
+		feedRecorders:    make(map[string]*FeedRecorder),
+		feedHealth:       make(map[string]bool),
+		truncatedMarkets: make(map[string]bool),
+		cfg:              cfg,
+		conn:             conn,
 	}
 }
 
@@ -117,6 +134,12 @@ func (c *EventCollector) StartSession(
 	// Register asset → market mapping for event routing.
 	c.assetMap[cfg.YesAssetID] = cfg.MarketID
 	c.assetMap[cfg.NoAssetID] = cfg.MarketID
+	if cfg.ConditionID != "" {
+		c.conditionMap[cfg.ConditionID] = cfg.MarketID
+	}
+	if cfg.NegRiskMarketID != "" {
+		c.negRiskMap[cfg.NegRiskMarketID] = append(c.negRiskMap[cfg.NegRiskMarketID], cfg.MarketID)
+	}
 
 	// Subscribe to both asset IDs on the WS.
 	conn.Subscribe([]string{cfg.YesAssetID, cfg.NoAssetID})
@@ -132,7 +155,11 @@ func (c *EventCollector) StartSession(
 }
 
 // StartSessionFromSlug is a convenience method that fetches market metadata
-// from the Polymarket Gamma API and starts a session.
+// from the Polymarket Gamma API and starts a session. The epoch scheduler does
+// not use it: discovery already returns the market's clobTokenIds, so the
+// fan-out builds SessionConfigs from the Gamma payload with no extra request.
+//
+// It remains for standalone/ad-hoc recordings and tests.
 func (c *EventCollector) StartSessionFromSlug(
 	conn connector.ExchangeConnector,
 	slug string,
@@ -145,8 +172,6 @@ func (c *EventCollector) StartSessionFromSlug(
 	if err != nil {
 		return nil, fmt.Errorf("collector: fetch market %s: %w", slug, err)
 	}
-
-	rawMarket, _ := json.Marshal(gamma)
 
 	cfg := SessionConfig{
 		MarketID:              gamma.ID,
@@ -170,10 +195,22 @@ func (c *EventCollector) StartSessionFromSlug(
 		"slug", slug,
 		"yes_asset", cfg.YesAssetID,
 		"no_asset", cfg.NoAssetID,
-		"raw_market_size", len(rawMarket),
 	)
 
 	return sess, nil
+}
+
+// ── Reference price (ladder strike filter) ──────────────────
+
+// SetSpotPrice records the latest reference price of the family's underlying
+// asset. The ladder strike filter picks rungs around it (CONTEXT.md §7).
+func (c *EventCollector) SetSpotPrice(price float64) {
+	c.spotBits.Store(math.Float64bits(price))
+}
+
+// SpotPrice returns the latest reference price, or 0 if none has been seen.
+func (c *EventCollector) SpotPrice() float64 {
+	return math.Float64frombits(c.spotBits.Load())
 }
 
 // HandleEvent is the callback registered with PolymarketConnector.SetOnEvent.
@@ -191,6 +228,13 @@ func (c *EventCollector) HandleEvent(ev any) {
 			c.routeFeed(FeedSourceChainlinkTWAP, "", e.Symbol, ev)
 		} else {
 			c.routeFeed(FeedSourceRTDS, "", e.Symbol, ev)
+			// The Binance RTDS reference price is the settlement venue's own
+			// price, so it is the right spot for the ladder strike filter.
+			if e.Source == "binance" {
+				if p := libs.ParseFloat(e.Price); p > 0 {
+					c.SetSpotPrice(p)
+				}
+			}
 		}
 		return
 	case *connector.BinanceBookTickerEvent:
@@ -202,24 +246,60 @@ func (c *EventCollector) HandleEvent(ev any) {
 	case *connector.BinanceDepthEvent:
 		c.routeFeed(FeedSourceBinance, e.Market, e.Symbol, ev)
 		return
+	case *connector.BinanceKlineEvent:
+		// Only final candles are persisted; FeedRecorder drops the rest, so a
+		// route here is cheap even at one update per second per candle.
+		c.routeFeed(FeedSourceBinance, e.Market, e.Symbol, ev)
+		return
 	}
 
 	typ := eventType(ev)
 	assetID := eventAssetID(ev)
 
 	// Determine the market ID for routing.
+	//
+	// A resolution is the one event with no asset id of its own, so it is routed
+	// by the winning token (an exact join — we subscribed to both sides), then by
+	// its condition id, and only then by the market id the WS reported. The
+	// last one is unreliable for a neg-risk ladder, where the payload can name
+	// the group instead of the rung (CONTEXT.md §13.2).
 	var marketID string
+	resolved, isResolved := ev.(*connector.MarketResolvedEvent)
+	if assetID == "" && isResolved {
+		assetID = resolved.WinningAssetID
+	}
 
 	c.mu.RLock()
 	if assetID != "" {
 		marketID = c.assetMap[assetID]
-	} else if resolved, ok := ev.(*connector.MarketResolvedEvent); ok {
+	}
+	if marketID == "" && isResolved {
+		marketID = c.conditionMap[resolved.ConditionID]
+	}
+	if marketID == "" && isResolved {
 		marketID = resolved.MarketID
 	}
 	sess, hasSession := c.sessions[marketID]
+	groupHeld := false
+	if !hasSession && isResolved {
+		_, groupHeld = c.negRiskMap[resolved.MarketID]
+	}
 	c.mu.RUnlock()
 
 	if !hasSession || sess == nil {
+		if groupHeld {
+			// The payload named a neg-risk group rather than the rung it resolved.
+			// Every rung's assets were subscribed, so this is not something we can
+			// disambiguate — say so loudly rather than dropping it silently, so a
+			// range market settling never looks like a market that simply never
+			// resolved.
+			slog.Error("collector: resolution names a neg-risk group, not a rung — cannot route",
+				"group", resolved.MarketID,
+				"condition", resolved.ConditionID,
+				"winning_asset", resolved.WinningAssetID,
+				"winning_outcome", resolved.WinningOutcome)
+			return
+		}
 		// No session for this event — silently drop.
 		return
 	}
@@ -286,9 +366,9 @@ func (c *EventCollector) HandleEvent(ev any) {
 	}
 
 	// If this is a MarketResolvedEvent, trigger resolution.
-	if _, ok := ev.(*connector.MarketResolvedEvent); ok {
-		resolved := ev.(*connector.MarketResolvedEvent)
-		if err := sess.Resolve(resolved.WinningAssetID); err != nil {
+	if isResolved {
+		winning := winningToken(sess.cfg, resolved.WinningAssetID, resolved.WinningOutcome)
+		if err := sess.Resolve(winning); err != nil {
 			slog.Error("collector: resolve failed", "market", marketID, "err", err)
 			return
 		}
@@ -299,11 +379,94 @@ func (c *EventCollector) HandleEvent(ev any) {
 	}
 }
 
+// winningToken resolves the token that won a market from a resolution payload.
+//
+// The winning asset id is authoritative; the outcome label is the fallback for
+// a payload that omits it, because Resolve records "YES" for anything that is
+// not the NO token — an absent id would otherwise be written as a YES win.
+// Only a payload with neither is left to that default, and that case is logged.
+func winningToken(cfg SessionConfig, winningAssetID, winningOutcome string) string {
+	if winningAssetID != "" {
+		return winningAssetID
+	}
+	switch strings.ToLower(strings.TrimSpace(winningOutcome)) {
+	case "no", "down":
+		return cfg.NoAssetID
+	case "yes", "up":
+		return cfg.YesAssetID
+	default:
+		slog.Warn("collector: resolution carries neither a winning asset id nor a usable outcome label",
+			"market", cfg.MarketID, "winning_outcome", winningOutcome)
+		return ""
+	}
+}
+
+// ── Resolved-market guard ───────────────────────────────────
+
+// ResolutionChecker is the slice of the connector the fan-out needs to refuse
+// claiming a market that has already resolved on-chain. Satisfied by the
+// Polymarket connector; absent (or nil) in tests that do not care.
+type ResolutionChecker interface {
+	GetResolution(marketID string) (*connector.Resolution, error)
+}
+
+// resolutionCheckWindow is how close to its settle instant a market must be
+// before the fan-out spends an HTTP round trip on GetResolution.
+//
+// Gamma's own `closed` flag and the settleAt-in-the-past check cover the normal
+// case; the gap they leave is a restart in the last minutes before settlement,
+// where a market can already be resolved on-chain while Gamma still reports it
+// open. Checking every claim would put a network dependency in the claim path
+// (11 extra calls per ladder event, on every restart) for no benefit, so the
+// check is confined to the window where it can matter (CONTEXT.md §13.3).
+const resolutionCheckWindow = 15 * time.Minute
+
+// alreadyResolved reports whether a market about to be claimed has already
+// resolved on-chain. It fails open: a lookup error returns false, because a
+// transient Gamma failure must never stop us recording a live market.
+func (c *EventCollector) alreadyResolved(marketID string, settleAt, now time.Time) bool {
+	if settleAt.Sub(now) > resolutionCheckWindow {
+		return false
+	}
+	checker, ok := c.conn.(ResolutionChecker)
+	if !ok || checker == nil {
+		return false
+	}
+	res, err := checker.GetResolution(marketID)
+	if err != nil {
+		slog.Warn("collector: resolution lookup failed, claiming anyway",
+			"market", marketID, "err", err)
+		return false
+	}
+	if res == nil || *res == "" {
+		return false
+	}
+	slog.Warn("collector: market already resolved on-chain, not recording it",
+		"market", marketID,
+		"resolution", string(*res),
+		"settle_at", settleAt.UTC().Format(time.RFC3339),
+	)
+	return true
+}
+
 // GetSession returns the recording session for a market ID, or nil.
 func (c *EventCollector) GetSession(marketID string) *RecordingSession {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.sessions[marketID]
+}
+
+// TruncatedMarkets returns the markets the run ended before they settled, as a
+// set keyed by market ID. Their recordings are partial and must never be read
+// as a settled outcome.
+func (c *EventCollector) TruncatedMarkets() map[string]bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[string]bool, len(c.truncatedMarkets))
+	for id := range c.truncatedMarkets {
+		out[id] = true
+	}
+	return out
 }
 
 // ActiveSessions returns the number of active (non-finalized) sessions.
@@ -469,17 +632,34 @@ func (c *EventCollector) StopAll() {
 	}
 	c.mu.RUnlock()
 
+	now := time.Now()
 	for _, sess := range sessions {
 		switch sess.State() {
 		case SessionRecording:
-			// Ctrl+C — apply synthetic resolve using last midprice for
-			// any session still recording (regardless of whether the
-			// market end time has passed or not).
-			slog.Info("collector: force-resolving session (mid-session stop)",
+			if sess.SettlementPassed(now) {
+				// The market settled but its resolution event never arrived, so a
+				// synthetic resolve from the last midprice is legitimate.
+				slog.Info("collector: force-resolving settled session",
+					"market", sess.cfg.MarketID,
+					"settle_at", sess.SettleAt().UTC().Format(time.RFC3339),
+				)
+				sess.handleSyntheticResolve()
+				break
+			}
+			// Stopping before settlement: the recording is partial. Mark it
+			// unsettled and finalize — never synthesize an outcome for it.
+			slog.Info("collector: truncating unfinished session (run stopping before settlement)",
 				"market", sess.cfg.MarketID,
-				"end_time", sess.cfg.MarketEndTime.Format("15:04:05"),
+				"slug", sess.cfg.Slug,
+				"settle_at", sess.SettleAt().UTC().Format(time.RFC3339),
 			)
-			sess.handleSyntheticResolve()
+			sess.MarkTruncated()
+			c.mu.Lock()
+			c.truncatedMarkets[sess.cfg.MarketID] = true
+			c.mu.Unlock()
+			if err := sess.Finalize(); err != nil {
+				slog.Error("collector: truncate-finalize failed", "market", sess.cfg.MarketID, "err", err)
+			}
 		case SessionResolved:
 			slog.Info("collector: force-finalizing resolved session", "market", sess.cfg.MarketID)
 			if err := sess.Finalize(); err != nil {
@@ -503,6 +683,22 @@ func (c *EventCollector) unsubscribeSession(sess *RecordingSession) {
 	delete(c.sessions, sess.cfg.MarketID)
 	delete(c.assetMap, sess.cfg.YesAssetID)
 	delete(c.assetMap, sess.cfg.NoAssetID)
+	if sess.cfg.ConditionID != "" {
+		delete(c.conditionMap, sess.cfg.ConditionID)
+	}
+	if group := sess.cfg.NegRiskMarketID; group != "" {
+		if held := c.negRiskMap[group]; len(held) > 1 {
+			kept := held[:0]
+			for _, id := range held {
+				if id != sess.cfg.MarketID {
+					kept = append(kept, id)
+				}
+			}
+			c.negRiskMap[group] = kept
+		} else {
+			delete(c.negRiskMap, group)
+		}
+	}
 	c.mu.Unlock()
 
 	if c.conn == nil {
@@ -519,185 +715,10 @@ func (c *EventCollector) unsubscribeSession(sess *RecordingSession) {
 
 // ── Rolling market series ───────────────────────────────────
 
-// cryptoPriceFetcher is implemented by connectors that expose Polymarket's
-// crypto-price API (open/close price over a market window).
-type cryptoPriceFetcher interface {
-	GetCryptoPrice(req connector.CryptoPriceRequest) (*connector.CryptoPrice, error)
-}
-
-// cryptoPriceTWAPLookback is the TWAP lookback window (seconds) used when
-// fetching a window's open/close price, so the recorded prices match
-// Polymarket's displayed TWAP reference price.
-const cryptoPriceTWAPLookback = 60
-
-// fetchWindowPrices fetches the underlying asset's open and close price for a
-// session's market window via Polymarket's crypto-price API. Called at
-// finalize so both prices are settled together from a single API call.
-//
-// A completed window (one that ran to its end time) records both the open and
-// close price: the API's series spans the full window and its last point is
-// the close. A market that ended midway (before its end time, e.g. an early
-// resolution or a mid-session stop) has no settled close, so only the open
-// price is recorded.
-func (c *EventCollector) fetchWindowPrices(sess *RecordingSession) {
-	if sess.series == "" {
-		return // standalone recording — no crypto config
-	}
-	fetcher, ok := c.conn.(cryptoPriceFetcher)
-	if !ok || fetcher == nil {
-		return
-	}
-	cfg, ok := libs.SERIES_CRYPTO_CONFIG[sess.series]
-	if !ok {
-		slog.Warn("collector: no crypto config for series", "series", sess.series)
-		return
-	}
-	cp, err := fetcher.GetCryptoPrice(connector.CryptoPriceRequest{
-		Symbol:              cfg.Symbol,
-		Variant:             cfg.Variant,
-		EventStartTime:      sess.cfg.MarketStartTime,
-		EndDate:             sess.cfg.MarketEndTime,
-		TWAPEnabled:         true,
-		TWAPLookbackSeconds: cryptoPriceTWAPLookback,
-	})
-	if err != nil {
-		slog.Warn("collector: fetch window prices failed",
-			"series", sess.series, "slug", sess.cfg.Slug, "err", err)
-		return
-	}
-	sess.SetOpenPrice(cp.OpenPrice)
-	closeVal := 0.0
-	if cp.ClosePrice != nil {
-		closeVal = *cp.ClosePrice
-		sess.SetClosePrice(closeVal)
-	}
-	slog.Info("collector: window prices (finalize)",
-		"series", sess.series,
-		"slug", sess.cfg.Slug,
-		"open", cp.OpenPrice,
-		"close", closeVal,
-	)
-}
-
-// StartSeries activates a rolling market series and begins continuous
-// recording on the given RuntimeManager.  It starts a session for the
-// current interval immediately, then registers a cron routine that fires
-// at each wall-clock-aligned interval boundary (e.g. every 5 min on the
-// :00) to start the next session.
-//
-// If sc.Count > 0, the cron unregisters after that many intervals.
-// If sc.Count == 0, it runs indefinitely.
-//
-// Visual: for btc_5m starting at 14:00:05
-//
-//	14:00:05  ── start session for [14:00, 14:05)
-//	14:05:00  ── cron → start session for [14:05, 14:10)
-//	14:10:00  ── cron → start session for [14:10, 14:15)
-//	...
-func (c *EventCollector) StartSeries(conn connector.ExchangeConnector, sc SeriesConfig) error {
-	series := libs.RollingMarketSeries(sc.Series)
-	intervalSec, err := libs.GetIntervalSeconds(series)
-	if err != nil {
-		return fmt.Errorf("invalid series %q: %w", sc.Series, err)
-	}
-
-	now := time.Now()
-	interval := time.Duration(intervalSec) * time.Second
-
-	// ── 1. Start current interval immediately ───────────────
-	alignedStart := now.Truncate(interval)
-	alignedEnd := alignedStart.Add(interval)
-
-	slug := libs.GenerateMarketSlug(series, alignedStart.Unix())
-	sess, err := c.StartSessionFromSlug(conn, slug, alignedStart, alignedEnd, 0)
-	if err != nil {
-		slog.Warn("collector: failed to start current interval",
-			"slug", slug, "err", err)
-	} else {
-		sess.series = series
-		slog.Info("collector: started current interval",
-			"series", sc.Series,
-			"slug", slug,
-			"window", fmt.Sprintf("%s → %s", alignedStart.Format("15:04:05"), alignedEnd.Format("15:04:05")),
-			"session", sess,
-		)
-	}
-
-	// ── 2. Register a cron routine for future intervals ─────
-	routineKey := abstract.RoutineKey(fmt.Sprintf("collector.series.%s", sc.Series))
-	remaining := sc.Count - 1 // current already consumed
-
-	// nextStart tracks the start time of the next interval.
-	// We advance it by interval each tick rather than computing from
-	// time.Now().Truncate(), which can produce wrong results near
-	// boundary crossings due to scheduling jitter.
-	nextStart := alignedEnd
-
-	c.rt.Register(abstract.RoutineRegistration{
-		Key:      routineKey,
-		Schedule: abstract.NewCronSchedule(interval, 0),
-		Priority: abstract.PrioritySystemRotation,
-		Handler:  c.newIntervalHandler(conn, series, interval, sc.Series, sc.Count, &remaining, routineKey, &nextStart),
-	})
-
-	slog.Info("collector: registered cron for series",
-		"series", sc.Series,
-		"interval", interval,
-		"count", sc.Count,
-		"next_boundary", alignedEnd.Format("15:04:05"),
-	)
-
-	return nil
-}
-
-// newIntervalHandler returns the cron handler that starts a new recording
-// session at each interval boundary and unregisters when the count limit
-// is reached.
-func (c *EventCollector) newIntervalHandler(
-	conn connector.ExchangeConnector,
-	series libs.RollingMarketSeries,
-	interval time.Duration,
-	seriesName string,
-	count int,
-	remaining *int,
-	key abstract.RoutineKey,
-	nextStart *time.Time,
-) func() {
-	return func() {
-		start := *nextStart
-		end := start.Add(interval)
-		slug := libs.GenerateMarketSlug(series, start.Unix())
-
-		sess, err := c.StartSessionFromSlug(conn, slug, start, end, 0)
-		if err != nil {
-			slog.Warn("collector: cron failed to start interval",
-				"series", seriesName, "slug", slug, "err", err)
-			return
-		}
-
-		sess.series = series
-		slog.Info("collector: cron started new interval",
-			"series", seriesName,
-			"slug", slug,
-			"window", fmt.Sprintf("%s → %s", start.Format("15:04:05"), end.Format("15:04:05")),
-			"session", sess,
-		)
-
-		// Advance nextStart by one interval.  If the cron was delayed
-		// (scheduling jitter), skip ahead to the current boundary so we
-		// don't create overlapping sessions.
-		*nextStart = end
-		for nextStart.Before(time.Now()) {
-			*nextStart = nextStart.Add(interval)
-		}
-
-		if count > 0 {
-			*remaining--
-			if *remaining <= 0 {
-				c.rt.Unregister(key)
-				slog.Info("collector: reached interval limit, unregistered cron",
-					"series", seriesName, "count", count)
-			}
-		}
-	}
-}
+// Discovery is driven by the epoch scheduler (scheduler.go): every market is
+// *discovered* from Gamma by matching the event that settles at the epoch's
+// target instant. The old StartSeries / newIntervalHandler pair synthesized
+// market slugs and truncated time.Now() to the interval, which silently
+// targeted the wrong market for every family except 5m/15m — the hourly slug
+// was built from the UTC hour while Polymarket labels hourly markets by the ET
+// hour. See CONTEXT.md §2/§3.

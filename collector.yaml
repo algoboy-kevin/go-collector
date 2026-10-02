@@ -1,51 +1,48 @@
-# Collector configuration — records Polymarket rolling markets to disk
-# for DES backtest replay.
+# Collector configuration — short BTC validation run.
 #
-# Usage:
-#   go run ./cmd/collector -config collector.yaml
+# Same schema as collector_daily.yaml, but only the families under test, so a
+# one-epoch run is cheap. Usage:
+#
 #   go run ./cmd/collector -config collector.yaml -recording-dir ./data
 #
+# See CONTEXT.md for the epoch model; see collector_daily.yaml for the full
+# five-family schedule.
 
 # Polymarket API credentials (required for WebSocket connection).
 # You can get these from https://polymarket.com/profile/api
+#
+# These are placeholders on purpose: never commit real credentials. Supply the
+# live values at deploy time, either by editing a copy of this file outside git
+# or by keeping one in .tmp/*.local.yaml (gitignored) and running
+# `./deploy.sh -config .tmp/collector_daily.local.yaml`.
 connector:
   api_key: "YOUR_POLYMARKET_API_KEY"
   api_secret: "YOUR_POLYMARKET_API_SECRET"
   api_passphrase: "YOUR_POLYMARKET_API_PASSPHRASE"
   gamma_api_url: "https://gamma-api.polymarket.com"
   market_ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-  user_ws_url:   "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+  user_ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/user"
   reconnect_interval_ms: 500
   pending_flush_ms: 100
 
-# Rolling market series to record.
-# Available series:
-#   BTC: btc_5m, btc_15m, btc_1h
-#   ETH: eth_5m, eth_15m, eth_1h
-#   SOL: sol_5m, sol_15m, sol_1h
-#   XRP: xrp_5m, xrp_15m, xrp_1h
-#
-# count: number of consecutive intervals to record.
-#   - 5m series: 12 intervals = 1 hour
-#   - 15m series: 4 intervals = 1 hour
-#   - 1h series: 24 intervals = 1 day
-#   Set to 0 to run indefinitely (until Ctrl+C).
+# One epoch, noon→noon ET.
+recording:
+  days: 1
+  epoch: noon_et
+  ladder_offset_days: 1
+
+# One hourly and one daily family is enough to validate the epoch model: the
+# hourly family proves ET-window alignment (building the hourly slug from the
+# UTC hour was the bug that motivated this rework), the daily one proves the
+# noon anchor.
 series:
-  - series: btc_5m
-    count: 50
-
-  # - series: sol_15m
-  #   count: 4     # 1 hour of 15-minute windows
-
-  # - series: xrp_1h
-  #   count: 24    # 1 day of hourly windows
+  - series: btc_1h
+  - series: btc_1d
 
 # RTDS — Polymarket real-time reference price for the underlying asset
-# (~1/sec). Continuous; cut into hourly buckets independent of market rotation.
+# (~1/sec). Continuous; cut into epoch buckets, independent of market rotation.
 #   symbols: RTDS symbols, e.g. "btcusdt"
-# Output: data/rtds/[{SOURCE}_]{SYMBOL}_{hourStartUnix}/events.gz + metadata.json
-#         (chainlink_twap folders are prefixed "chainlink_twap_" to avoid
-#         colliding with the same symbol recorded as an RTDS reference price)
+# Output: data/rtds/[{chainlink_twap_}]{symbol}_{epochID}/events.gz + metadata.json
 rtds:
   crypto_prices:
     enabled: true
@@ -59,21 +56,22 @@ rtds:
       - btc/usd
     window: 60
 
-# Binance — HFT market data for the underlying asset (aggTrade + partial
-# book depth, top-20 @100ms), used to build the 60s TWAP / forecast features in
-# Python. Continuous; cut into hourly buckets independent of market rotation.
-#   market:  "perp" (USDⓈ-M perpetual, default) or "spot"
-#   symbols: Binance symbols, e.g. "BTCUSDT"
-#   streams: "aggTrade", "depth" (empty = all)
-# Output: data/binance/{SYMBOL}_{hourStartUnix}/events.gz + metadata.json
+# Binance — the SETTLEMENT VENUE. Both families above resolve on a Binance
+# BTC/USDT candle, so aggTrade is the settlement source; each market's metadata
+# names the bucket its outcome can be recomputed from.
+#   market:  "spot" (the settlement venue) or "perp" (only useful for basis)
+#   streams: "aggTrade"  every trade — the 1m settle candle is derived from it
+#            "depth"     top-20 @100ms
+#            "kline_5m"  FINAL candles only — cross-check for the derived candle
+# Output: data/binance/{market}/{symbol}_{epochID}/events.gz + metadata.json
 binance:
-  perp:
+  spot:
     symbols:
       - BTCUSDT
     streams:
       - aggTrade
-      - depth
+      - kline_5m
 
-  spot:
+  perp:
     symbols: ""
     streams: []

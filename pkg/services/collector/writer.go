@@ -83,6 +83,24 @@ func filterConnectionEvents(connEvents []ConnectionEvent, startMs, endMs int64) 
 	return out
 }
 
+// writeJSONFile writes v as indented JSON to path, creating parent directories.
+// Used for the epoch manifest, which lives directly in the epoch directory
+// rather than in a sub-directory of its own.
+func writeJSONFile(path string, v any) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("writeJSONFile: mkdir: %w", err)
+	}
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return fmt.Errorf("writeJSONFile: marshal: %w", err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0644); err != nil {
+		return fmt.Errorf("writeJSONFile: write: %w", err)
+	}
+	slog.Debug("collector: wrote json file", "path", path)
+	return nil
+}
+
 // writeMetadata writes metadata to {dir}/{name}/metadata.json. meta may be a
 // *MarketMetadata (market sessions) or *FeedMetadata (feed buckets).
 func writeMetadata(dir, name string, meta any) error {

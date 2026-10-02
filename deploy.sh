@@ -14,8 +14,14 @@
 #
 # Usage:
 #   ./deploy.sh -server root@YOUR.IP.GOES.HERE -ssh-key ~/.ssh/id_ed25519 -heap 256mb
+#   ./deploy.sh -server root@YOUR.IP.GOES.HERE -ssh-key ~/.ssh/id_ed25519 -config collector.yaml
 #
-# Required: -server and -ssh-key. Optional: -heap (default 256mb).
+# Required: -server and -ssh-key. Optional: -heap (default 256mb) and
+# -config (default collector_daily.yaml — the full 5-family, 3-epoch schedule;
+# collector.yaml is the short 1-epoch validation run).
+#
+# NOTE: the collector runs for `recording.days` epochs and then exits by itself;
+# re-deploying wipes the remote data directory, so download before re-deploying.
 
 set -euo pipefail
 
@@ -28,13 +34,15 @@ REMOTE_DIR="/root/go-collector"
 REMOTE_DATA_DIR="$REMOTE_DIR/data"
 REMOTE_BIN="$REMOTE_DIR/collector"
 REMOTE_CONFIG="$REMOTE_DIR/collector.yaml"
+REMOTE_LOG="$REMOTE_DIR/collector.log"
 
 # Local paths.
 LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOCAL_BIN="$LOCAL_DIR/bin/collector"
-LOCAL_CONFIG="$LOCAL_DIR/collector.yaml"
+CONFIG_NAME="collector_daily.yaml"
+LOCAL_CONFIG="$LOCAL_DIR/$CONFIG_NAME"
 
-# ── Parse flags ──────────────────────────────────────────────────────────────
+# ── Parse flags ──────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -server)
@@ -43,9 +51,12 @@ while [[ $# -gt 0 ]]; do
       SSH_KEY="$2"; shift 2 ;;
     -heap)
       MAX_HEAP="$2"; shift 2 ;;
+    -config)
+      CONFIG_NAME="$2"; shift 2
+      LOCAL_CONFIG="$LOCAL_DIR/$CONFIG_NAME" ;;
     *)
       echo "Unknown flag: $1" >&2
-      echo "Usage: $0 -server root@YOUR.IP.GOES.HERE -ssh-key ~/.ssh/id_ed25519 -heap 256mb" >&2
+      echo "Usage: $0 -server root@YOUR.IP.GOES.HERE -ssh-key ~/.ssh/id_ed25519 [-heap 256mb] [-config collector_daily.yaml]" >&2
       exit 1 ;;
   esac
 done
@@ -57,6 +68,10 @@ if [[ -z "$SERVER" || "$SERVER" == *"YOUR.IP.GOES.HERE"* ]]; then
 fi
 if [[ -z "$SSH_KEY" ]]; then
   echo "Error: -ssh-key is required (e.g. -ssh-key ~/.ssh/id_ed25519)" >&2
+  exit 1
+fi
+if [[ ! -f "$LOCAL_CONFIG" ]]; then
+  echo "Error: config not found: $LOCAL_CONFIG" >&2
   exit 1
 fi
 
@@ -80,9 +95,24 @@ scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -o BatchMode=yes "$LOCAL_CONFIG" "
 echo "    deployed: $REMOTE_BIN"
 echo "    deployed: $REMOTE_CONFIG"
 
-# ── 3. Run the collector on the server with max heap ────────────────────────
-echo "==> Starting collector on $SERVER (max heap: $MAX_HEAP) ..."
+# ── 3. Run the collector on the server (detached) with max heap ──────────────
+# The collector is long-running (it records for `recording.days` epochs), so it
+# must be fully detached — foregrounding it through ssh would leave deploy.sh
+# attached to the collector's live log stream and it would never return.
+#
+# Plain "nohup ... &" is NOT enough: the process stays in the same session as
+# the sshd channel, so ssh waits for it to exit and deploy.sh still hangs.
+# setsid starts the collector in a brand-new session (no controlling tty), so
+# sshd sees the session end, the ssh call returns, and the collector keeps
+# running on its own. Output goes to $REMOTE_LOG; we only print the tail to
+# confirm startup.
+echo "==> Starting collector on $SERVER (max heap: $MAX_HEAP, log: $REMOTE_LOG) ..."
 ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o BatchMode=yes "$SERVER" \
-  "cd $REMOTE_DIR && GOME_MAXHEAP=$MAX_HEAP ./collector -config $REMOTE_CONFIG"
+  "cd $REMOTE_DIR && GOME_MAXHEAP=$MAX_HEAP setsid ./collector -config $REMOTE_CONFIG > $REMOTE_LOG 2>&1 < /dev/null &"
 
-echo "==> Done."
+# Give it a moment to boot, then show only the last log lines (not a live tail).
+sleep 3
+ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o BatchMode=yes "$SERVER" "tail -n 20 $REMOTE_LOG"
+
+echo "==> Done. Collector running in the background on $SERVER."
+echo "    Watch it live:  ssh -i $SSH_KEY $SERVER 'tail -f $REMOTE_LOG'"

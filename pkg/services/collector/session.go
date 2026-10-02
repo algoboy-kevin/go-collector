@@ -72,16 +72,17 @@ type RecordingSession struct {
 	// Resolution tracking
 	winningOutcome        string  // "YES" or "NO" — set by Resolve()
 	resolvedSynthetically bool    // true if resolved via synthetic midprice
+	resolveBasis          string  // how the outcome was decided (ResolutionBasis*)
 	lastMidprice          float64 // last computed midprice (for synthetic resolve), -1 if unavailable
 
 	// Underlying asset price at the window open/close (crypto-price API).
 	openPrice  float64
 	closePrice float64
 
-	// series identifies the rolling market series this session belongs to
-	// (empty for standalone recordings). Used at finalize to fetch the
-	// window's open/close price via SERIES_CRYPTO_CONFIG.
-	series libs.RollingMarketSeries
+	// meta describes where this market sits — epoch, series family, Gamma event
+	// and settlement rule — and is written verbatim into metadata.json. The zero
+	// value means a standalone recording: no epoch directory, no family blocks.
+	meta MarketContext
 }
 
 // newRecordingSession creates a new session in RECORDING state and starts
@@ -161,8 +162,7 @@ func (s *RecordingSession) ensureWriterLocked() error {
 	if s.enc != nil {
 		return nil
 	}
-	dir := s.collector.recordingDir()
-	marketDir := filepath.Join(dir, s.cfg.MarketID)
+	marketDir := s.dir()
 	if err := os.MkdirAll(marketDir, 0755); err != nil {
 		return fmt.Errorf("ensureWriter: mkdir: %w", err)
 	}
@@ -318,6 +318,74 @@ func (s *RecordingSession) SetClosePrice(price float64) {
 	s.closePrice = price
 }
 
+// SetMarketContext attaches the discovery-derived context (epoch, family,
+// event, settlement rule) to the session. Call it before the market settles;
+// it is safe to call concurrently with Record.
+func (s *RecordingSession) SetMarketContext(mc MarketContext) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.meta = mc
+}
+
+// MarketContext returns a copy of the session's discovery context. It is the
+// zero value for a standalone recording, so callers should check Empty().
+func (s *RecordingSession) MarketContext() MarketContext {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.meta
+}
+
+// MarkTruncated records that the run ended before this market settled, so the
+// metadata is written as "unsettled" rather than given a synthesized outcome.
+func (s *RecordingSession) MarkTruncated() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.meta.Truncated = true
+}
+
+// marketRoot is the directory the market folder lives in:
+// {recordingDir}/[{epoch}]. The epoch level groups a settlement day's markets.
+func (s *RecordingSession) marketRoot() string {
+	base := s.collector.recordingDir()
+	if s.meta.EpochID == "" {
+		return base
+	}
+	return filepath.Join(base, s.meta.EpochID)
+}
+
+// dir is the session's own folder: {recordingDir}/[{epoch}/]{marketID}.
+func (s *RecordingSession) dir() string {
+	return filepath.Join(s.marketRoot(), s.cfg.MarketID)
+}
+
+// settleAtLocked is the instant this market resolves: the discovered
+// settlement anchor when we have one, else the configured window end.
+// Caller holds s.mu.
+func (s *RecordingSession) settleAtLocked() time.Time {
+	if s.meta.Settlement != nil && s.meta.Settlement.At > 0 {
+		return time.UnixMilli(s.meta.Settlement.At)
+	}
+	return s.cfg.MarketEndTime
+}
+
+// SettleAt returns the market's settlement instant. Thread-safe.
+func (s *RecordingSession) SettleAt() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.settleAtLocked()
+}
+
+// SettlementPassed reports whether the market's settlement instant has passed.
+// A session still recording past this point settled without us seeing the
+// resolution event, so a synthetic resolve is legitimate; before it, stopping
+// the run means the recording is simply truncated.
+func (s *RecordingSession) SettlementPassed(now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	at := s.settleAtLocked()
+	return !at.IsZero() && !now.Before(at)
+}
+
 // Resolve transitions the session to RESOLVED state.  Thread-safe.
 // Returns an error if already resolved or finalized.
 func (s *RecordingSession) Resolve(winningAssetID string) error {
@@ -344,6 +412,10 @@ func (s *RecordingSession) Resolve(winningAssetID string) error {
 	if winningAssetID == s.cfg.NoAssetID {
 		s.winningOutcome = "NO"
 	}
+	if !s.resolvedSynthetically {
+		// The market's own resolution message: authoritative.
+		s.resolveBasis = ResolutionBasisOnchain
+	}
 
 	slog.Info("collector: session resolved",
 		"market", s.cfg.MarketID,
@@ -365,14 +437,8 @@ func (s *RecordingSession) Finalize() error {
 		return nil
 	}
 	s.state = SessionFinalized
+	mc := s.meta // snapshot under the lock: Truncated is set at shutdown
 	s.mu.Unlock()
-
-	// Fetch underlying open/close prices at finalize so both are settled
-	// together from a single API call. A market that ended midway (before
-	// its end time) records only the open price.
-	if s.collector != nil {
-		s.collector.fetchWindowPrices(s)
-	}
 
 	// Close the streaming events.gz and finalize the gap/latency stats.
 	gi, connInfo, err := s.closeEventStream()
@@ -380,7 +446,13 @@ func (s *RecordingSession) Finalize() error {
 		return fmt.Errorf("finalize %s: %w", s.cfg.MarketID, err)
 	}
 
-	// Build metadata.
+	// Build metadata. StartTime is when this session's recording window opened;
+	// EndTime is the market's settle instant — Settlement.At when discovery gave
+	// us one, else the configured window end.
+	endTime := s.cfg.MarketEndTime
+	if mc.Settlement != nil && mc.Settlement.At > 0 {
+		endTime = time.UnixMilli(mc.Settlement.At)
+	}
 	meta := &MarketMetadata{
 		MarketID:         s.cfg.MarketID,
 		Slug:             s.cfg.Slug,
@@ -388,22 +460,29 @@ func (s *RecordingSession) Finalize() error {
 		NoAssetID:        s.cfg.NoAssetID,
 		Question:         s.cfg.Question,
 		ConditionID:      s.cfg.ConditionID,
+		EpochID:          mc.EpochID,
 		StartTime:        s.cfg.MarketStartTime.UnixMilli(),
-		EndTime:          s.cfg.MarketEndTime.UnixMilli(),
-		Resolution:       s.winningOutcome,
+		EndTime:          endTime.UnixMilli(),
+		Resolution:       mc.ResolutionFor(s.winningOutcome),
 		WinningOutcome:   s.winningOutcome,
 		SyntheticResolve: s.resolvedSynthetically,
+		ResolutionBasis:  s.writeBasis(mc.Truncated),
+		Truncated:        mc.Truncated,
 		LastMidprice:     s.lastMidprice,
 		OpenPrice:        s.openPrice,
 		ClosePrice:       s.closePrice,
+		Family:           mc.Family,
+		Event:            mc.Event,
+		Settlement:       mc.Settlement,
+		StrikeFilter:     mc.StrikeFilter,
 		EventCount:       int(s.count),
 		RecordedAt:       time.Now().UnixMilli(),
 	}
 	meta.DataQuality = gi
 	meta.Connections = connInfo
 
-	// Write metadata.json.
-	if err := writeMetadata(s.collector.recordingDir(), s.cfg.MarketID, meta); err != nil {
+	// Write metadata.json under {recordingDir}/[{epoch}/]{marketID}/.
+	if err := writeMetadata(s.marketRoot(), s.cfg.MarketID, meta); err != nil {
 		return fmt.Errorf("finalize %s: writeMetadata: %w", s.cfg.MarketID, err)
 	}
 
@@ -422,6 +501,16 @@ func (s *RecordingSession) Finalize() error {
 }
 
 // ── Helpers ──────────────────────────────────────────────────
+
+// writeBasis is the ResolutionBasis to persist: the basis the resolution used,
+// or empty when there is no outcome to qualify (an unsettled, truncated session,
+// or one that was never resolved at all).
+func (s *RecordingSession) writeBasis(truncated bool) string {
+	if truncated || s.winningOutcome == "" {
+		return ""
+	}
+	return s.resolveBasis
+}
 
 // eventType returns the type discriminator string for a raw event.
 func eventType(ev interface{}) string {
@@ -470,6 +559,14 @@ func (s *RecordingSession) handleSyntheticResolve() {
 		s.mu.Unlock()
 		return
 	}
+	// A truncated session (the run stopped before settlement) must never get a
+	// synthesized outcome — it is written as "unsettled".
+	if s.meta.Truncated {
+		slog.Info("collector: skipping synthetic resolve for truncated session",
+			"market", s.cfg.MarketID)
+		s.mu.Unlock()
+		return
+	}
 	// Mark as synthetic before computing midprice (under lock).
 	s.resolvedSynthetically = true
 	// Find the last book snapshot for midprice.
@@ -478,17 +575,21 @@ func (s *RecordingSession) handleSyntheticResolve() {
 
 	lastMidprice := s.lastMidprice
 
-	winningAssetID := s.cfg.NoAssetID
-	if lastMidprice < 0 {
+	winningAssetID, basis := resolveFromMidprice(lastMidprice, s.cfg)
+
+	s.mu.Lock()
+	s.resolveBasis = basis
+	s.mu.Unlock()
+
+	if basis == ResolutionBasisNoBook {
 		slog.Warn("collector: synthetic resolve — no orderbook data, defaulting to NO",
 			"market", s.cfg.MarketID)
-	} else if lastMidprice >= 0.5 {
-		winningAssetID = s.cfg.YesAssetID
 	}
 
 	slog.Info("collector: synthetic resolve",
 		"market", s.cfg.MarketID,
 		"last_midprice", lastMidprice,
+		"basis", basis,
 		"winner", winningAssetID,
 	)
 
@@ -499,6 +600,43 @@ func (s *RecordingSession) handleSyntheticResolve() {
 
 	if err := s.Finalize(); err != nil {
 		slog.Error("collector: synthetic finalize failed", "market", s.cfg.MarketID, "err", err)
+	}
+}
+
+// Midprice bounds a SETTLED market's book collapses into.
+//
+// A resolved market's book goes one-sided: if YES won, the YES token bids at
+// ~0.99 and nobody offers to sell it, so there is no ask — midpriceFromBook
+// substitutes the maximum (1.00), and the midprice reads (0.99+1)/2 = 0.995.
+// The mirror case (NO won) leaves the bid side empty with the ask at ~0.01,
+// reading (0+0.01)/2 = 0.005. So a midprice this far out is the outcome itself,
+// not a probability.
+const (
+	collapsedBookYesMid = 0.99
+	collapsedBookNoMid  = 0.01
+)
+
+// resolveFromMidprice decides a market's outcome from the last midprice taken a
+// minute past the settlement instant, and reports how it decided.
+//
+// The collapsed-book bounds come first because they are evidence rather than a
+// guess: a book that has already gone one-sided *is* the resolution. A midprice
+// still between them means the book had not collapsed by the time we looked —
+// typically a book frozen since before settlement — so the outcome falls back to
+// the 0.5 boundary and is recorded as the weaker `midprice` basis, and a session
+// with no book at all (mid < 0) defaults to NO, recorded as `no_book`.
+func resolveFromMidprice(mid float64, cfg SessionConfig) (winningAssetID, basis string) {
+	switch {
+	case mid < 0:
+		return cfg.NoAssetID, ResolutionBasisNoBook
+	case mid >= collapsedBookYesMid:
+		return cfg.YesAssetID, ResolutionBasisCollapsedBook
+	case mid <= collapsedBookNoMid:
+		return cfg.NoAssetID, ResolutionBasisCollapsedBook
+	case mid >= 0.5:
+		return cfg.YesAssetID, ResolutionBasisMidprice
+	default:
+		return cfg.NoAssetID, ResolutionBasisMidprice
 	}
 }
 

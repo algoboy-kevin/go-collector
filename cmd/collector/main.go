@@ -30,6 +30,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/algoboy-kevin/go-collector/pkg/libs"
 	"github.com/algoboy-kevin/go-collector/pkg/services/collector"
 	"github.com/algoboy-kevin/go-collector/pkg/services/runtime"
 	"github.com/algoboy-kevin/go-exchange-connector/pkg/binance"
@@ -42,13 +43,14 @@ import (
 type Config struct {
 	// DataDir is the base data directory; market/, rtds/ and binance/ live
 	// here as subdirectories. Default: "data".
-	DataDir    string                   `yaml:"data_dir"`
-	RTDSDir    string                   `yaml:"rtds_dir"`    // optional override for rtds root
-	BinanceDir string                   `yaml:"binance_dir"` // optional override for binance root
-	Connector  polymarket.Config        `yaml:"connector"`
-	Series     []collector.SeriesConfig `yaml:"series"`
-	RTDS       collector.RTDSConfig     `yaml:"rtds"`
-	Binance    collector.BinanceConfig  `yaml:"binance"`
+	DataDir    string                    `yaml:"data_dir"`
+	RTDSDir    string                    `yaml:"rtds_dir"`    // optional override for rtds root
+	BinanceDir string                    `yaml:"binance_dir"` // optional override for binance root
+	Connector  polymarket.Config         `yaml:"connector"`
+	Series     []collector.SeriesConfig  `yaml:"series"`
+	Recording  collector.RecordingConfig `yaml:"recording"`
+	RTDS       collector.RTDSConfig      `yaml:"rtds"`
+	Binance    collector.BinanceConfig   `yaml:"binance"`
 }
 
 func main() {
@@ -74,7 +76,33 @@ func main() {
 		dataDir = collector.DefaultDataDir
 	}
 
-	slog.Info("collector starting", "config", *configPath)
+	// The daily epoch is what every feed bucket and market recording is keyed
+	// to, so resolve and validate it before anything opens a file.
+	anchor, err := cfg.Recording.Anchor()
+	if err != nil {
+		slog.Error("invalid recording epoch", "epoch", cfg.Recording.Epoch, "err", err)
+		os.Exit(1)
+	}
+	epochID, err := libs.EpochID(time.Now(), anchor)
+	if err != nil {
+		slog.Error("cannot resolve current epoch", "err", err)
+		os.Exit(1)
+	}
+	epochStart, epochEnd, err := libs.EpochBounds(epochID, anchor)
+	if err != nil {
+		slog.Error("cannot resolve epoch bounds", "epoch", epochID, "err", err)
+		os.Exit(1)
+	}
+
+	slog.Info("collector starting",
+		"config", *configPath,
+		"epoch", epochID,
+		"anchor", string(anchor),
+		"epoch_start", epochStart.UTC().Format(time.RFC3339),
+		"epoch_end", epochEnd.UTC().Format(time.RFC3339),
+		"days", cfg.Recording.Days,
+		"ladder_offset_days", cfg.Recording.OffsetDays(),
+	)
 
 	// ── 1. Create RuntimeManager in COLLECTOR mode ──────────
 	rt, err := runtime.New(runtime.ModeCollector)
@@ -93,11 +121,12 @@ func main() {
 
 	defer conn.Stop()
 
-	// ── 4. Create EventCollector ────────────────────────────
-	// Market recordings live under {dataDir}/market.
+	// ── 4. Create EventCollector ──────────────────────
+	// Market recordings live under {dataDir}/market/<epoch>/.
 	ec := collector.NewCollector(collector.CollectorConfig{
 		RecordingDir: filepath.Join(dataDir, "market"),
-	}, rt, conn)
+		EpochAnchor:  anchor,
+	}, conn)
 
 	conn.SetDispatcher(ec.HandleEvent)
 
@@ -125,7 +154,7 @@ func main() {
 	// crypto_prices symbols (e.g. "btcusdt").
 	if cfg.RTDS.CryptoPrices.Enabled {
 		for _, sym := range cfg.RTDS.CryptoPrices.Symbols {
-			fr := collector.NewFeedRecorder(feedDir(cfg.RTDSDir, dataDir, "rtds"), sym, collector.FeedSourceRTDS, "")
+			fr := collector.NewFeedRecorder(feedDir(cfg.RTDSDir, dataDir, "rtds"), sym, collector.FeedSourceRTDS, "", anchor)
 			ec.AddFeedRecorder(fr)
 			fr.Start(rt.RootContext())
 			if strings.Contains(sym, "/") {
@@ -145,7 +174,7 @@ func main() {
 			window = 60
 		}
 		for _, feed := range cfg.RTDS.ChainlinkTWAP.Feeds {
-			fr := collector.NewFeedRecorder(feedDir(cfg.RTDSDir, dataDir, "rtds"), feed, collector.FeedSourceChainlinkTWAP, "")
+			fr := collector.NewFeedRecorder(feedDir(cfg.RTDSDir, dataDir, "rtds"), feed, collector.FeedSourceChainlinkTWAP, "", anchor)
 			ec.AddFeedRecorder(fr)
 			fr.Start(rt.RootContext())
 			conn.SubscribeChainlinkTWAP(rt.RootContext(), window, []string{feed})
@@ -187,7 +216,7 @@ func main() {
 			binanceStarted = true
 		}
 		for _, sym := range m.cfg.Symbols {
-			fr := collector.NewFeedRecorder(feedDir(cfg.BinanceDir, dataDir, "binance"), sym, collector.FeedSourceBinance, m.name)
+			fr := collector.NewFeedRecorder(feedDir(cfg.BinanceDir, dataDir, "binance"), sym, collector.FeedSourceBinance, m.name, anchor)
 			ec.AddFeedRecorder(fr)
 			fr.Start(rt.RootContext())
 			subscribeBinanceStreams(bn, rt.RootContext(), m.mkt, sym, m.cfg.Streams)
@@ -195,11 +224,18 @@ func main() {
 		}
 	}
 
-	// ── 5. Start recording sessions for each series ─────────
-	for _, sc := range cfg.Series {
-		if err := ec.StartSeries(conn, sc); err != nil {
-			slog.Error("failed to start series", "series", sc.Series, "err", err)
-		}
+	// ── 5. Start the epoch scheduler ────────────────────────
+	// Series are *discovered* from Gamma, never synthesized: each tick resolves
+	// the settlement instant each family's live market has, finds the event that
+	// settles at exactly that instant, and fans it out to one recording session
+	// per market (a ladder event fans out to N). See CONTEXT.md §3/§4.
+	sched, err := collector.NewEpochScheduler(ec, conn, collector.SchedulerConfig{
+		Recording: cfg.Recording,
+		Series:    cfg.Series,
+	})
+	if err != nil {
+		slog.Error("failed to build the epoch scheduler", "err", err)
+		os.Exit(1)
 	}
 
 	// ── 5b. Feed liveness monitor (RTDS / binance) ──────────
@@ -207,42 +243,58 @@ func main() {
 	// periodic health summary so binance + RTDS are visible like the market.
 	ec.StartHealthMonitor(rt.RootContext(), 15*time.Second)
 
-	// Arm the cron routines so they fire at interval boundaries.
 	rt.Start()
+
+	// The scheduler owns the run's lifetime: it stops after `days` epochs, or
+	// when its context is cancelled.
+	schedCtx, stopScheduler := context.WithCancel(rt.RootContext())
+	defer stopScheduler()
+	schedDone := make(chan error, 1)
+	go func() { schedDone <- sched.Run(schedCtx) }()
 
 	slog.Info("collector running", "active_sessions", ec.ActiveSessions())
 
-	// ── 6. Wait for shutdown signal ─────────────────────────
+	// ── 6. Wait for shutdown ────────────────────────────────
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
-	// Also exit if all sessions complete.
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				if ec.ActiveSessions() == 0 {
-					slog.Info("collector: all sessions finalized, shutting down")
-					sigCh <- syscall.SIGTERM
-					return
-				}
-			case <-rt.RootContext().Done():
-				return
-			}
+	// There is deliberately no "all sessions finalized → exit" watcher here: the
+	// scheduler runs a rolling set of markets and legitimately has zero active
+	// sessions between windows. The run ends when `days` epochs have been
+	// recorded, or on a signal.
+	select {
+	case sig := <-sigCh:
+		slog.Info("collector shutting down", "signal", sig)
+		// Stop the scheduler claiming markets before anything is finalized, so
+		// it cannot start a session that nothing will ever finalize.
+		stopScheduler()
+		select {
+		case <-schedDone:
+		case <-time.After(10 * time.Second):
+			slog.Warn("scheduler did not stop within 10s, finalizing anyway")
 		}
-	}()
-
-	sig := <-sigCh
-	slog.Info("collector shutting down", "signal", sig)
+	case err := <-schedDone:
+		if err != nil {
+			slog.Error("scheduler stopped with an error", "err", err)
+		} else {
+			slog.Info("scheduler finished")
+		}
+	}
 
 	// ── 7. Graceful shutdown ────────────────────────────────
 	// Stop connector first to tear down WS, then cancel runtime
 	// (prevents reconnect racing between context cancel and WS stop).
 	conn.Stop()  // stops WS immediately (no new events)
 	ec.StopAll() // finalize remaining sessions + close feed buckets (writes metadata)
-	rt.Stop()    // cancels root context last
+
+	// Write the epoch manifests last: sessions that the run outlived are now
+	// marked unsettled, and the feeds list is complete. Finalize is idempotent —
+	// Run already called it when it reached `days`.
+	if err := sched.Finalize(); err != nil {
+		slog.Error("failed to write epoch manifests", "err", err)
+	}
+
+	rt.Stop() // cancels root context last
 	slog.Info("collector stopped")
 }
 
@@ -252,7 +304,16 @@ func loadConfig(path string) (*Config, error) {
 	cfg := &Config{
 		DataDir: collector.DefaultDataDir,
 		Series: []collector.SeriesConfig{
-			{Series: "btc_5m", Count: 10},
+			{Series: "btc_1h"},
+			{Series: "btc_4h"},
+			{Series: "btc_1d"},
+			{Series: "btc_above", Strikes: 3},
+			{Series: "btc_range", Strikes: 3},
+		},
+		Recording: collector.RecordingConfig{
+			Days:             3,
+			Epoch:            string(libs.AnchorNoonET),
+			LadderOffsetDays: 1,
 		},
 		RTDS: collector.RTDSConfig{
 			CryptoPrices: collector.CryptoPricesConfig{
@@ -266,9 +327,12 @@ func loadConfig(path string) (*Config, error) {
 			},
 		},
 		Binance: collector.BinanceConfig{
-			Perp: collector.BinanceMarketConfig{
+			// Spot is the settlement venue every BTC family resolves on; the 5m
+			// klines are its integrity cross-check. Perp is off by default — it is
+			// only useful for basis.
+			Spot: collector.BinanceMarketConfig{
 				Symbols: []string{"BTCUSDT"},
-				Streams: []string{"aggTrade", "depth"},
+				Streams: []string{"aggTrade", "depth", "kline_5m"},
 			},
 		},
 	}
@@ -299,23 +363,36 @@ func feedDir(explicit, base, feed string) string {
 }
 
 // subscribeBinanceStreams subscribes the configured Binance streams for a
-// symbol. An empty stream list subscribes all (aggTrade + partial depth).
+// symbol. An empty stream list subscribes all of them.
 func subscribeBinanceStreams(bn *binance.WSBinance, ctx context.Context, mkt binance.MarketType, symbol string, streams []string) {
-	enabled := func(name string) bool {
+	enabled := func(names ...string) bool {
+		if len(streams) == 0 {
+			return true
+		}
 		for _, s := range streams {
-			if strings.EqualFold(strings.TrimSpace(s), name) {
-				return true
+			for _, name := range names {
+				if strings.EqualFold(strings.TrimSpace(s), name) {
+					return true
+				}
 			}
 		}
-		return len(streams) == 0
+		return false
 	}
-	if enabled("aggTrade") || enabled("trades") {
+	if enabled("aggTrade", "trades") {
 		bn.SubscribeTrades(ctx, mkt, []string{symbol})
 	}
 	// Partial book depth (@depth20@100ms): a passive top-20 snapshot pushed by
 	// Binance — no local book / REST seeding. Replaces the old diff-depth full
 	// book which dominated memory/volume. (Binance only supports 5/10/20 levels.)
-	if enabled("depth") || enabled("book") {
+	if enabled("depth", "book") {
 		bn.SubscribePartialDepth(ctx, mkt, []string{symbol}, 20, "100ms")
+	}
+	// Final 5m candles: the integrity cross-check for the 1m settlement candle
+	// derived from aggTrade (CONTEXT.md §7). The collector persists only
+	// IsFinal messages — the in-progress updates are redundant with aggTrade.
+	if enabled("kline_5m", "kline", "klines") {
+		if err := bn.SubscribeKlines(ctx, mkt, []string{symbol}, "5m"); err != nil {
+			slog.Error("collector: failed to subscribe klines", "symbol", symbol, "err", err)
+		}
 	}
 }

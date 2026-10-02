@@ -1,8 +1,12 @@
 package collector
 
 import (
+	"bytes"
+	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/algoboy-kevin/go-collector/pkg/libs"
 	"gopkg.in/yaml.v3"
 )
 
@@ -76,5 +80,102 @@ binance:
 	}
 	if len(raw.Binance.Spot.Symbols) != 0 {
 		t.Fatalf("spot symbols = %v, want empty (nil)", raw.Binance.Spot.Symbols)
+	}
+}
+
+// TestRecordingConfigDefaults pins the epoch defaults: noon ET, offset 1, and
+// `days: 0` meaning "run until stopped".
+func TestRecordingConfigDefaults(t *testing.T) {
+	var zero RecordingConfig
+	anchor, err := zero.Anchor()
+	if err != nil {
+		t.Fatalf("zero Anchor(): %v", err)
+	}
+	if anchor != libs.AnchorNoonET {
+		t.Errorf("default anchor = %q, want %q", anchor, libs.AnchorNoonET)
+	}
+	if got := zero.OffsetDays(); got != 1 {
+		t.Errorf("default ladder offset = %d, want 1", got)
+	}
+	if got := (RecordingConfig{LadderOffsetDays: 2}).OffsetDays(); got != 2 {
+		t.Errorf("ladder offset = %d, want 2", got)
+	}
+
+	bad := RecordingConfig{Epoch: "utc_midnight"}
+	if _, err := bad.Anchor(); err == nil {
+		t.Error("an unknown epoch rule should be rejected, not silently defaulted")
+	}
+}
+
+// TestShippedConfigsDecode validates the configs in the repo root against the
+// live schema: every key must exist — a stale `count:` or a renamed series is a
+// startup failure on the server, so it should fail here — and every series must
+// be a registry row.
+func TestShippedConfigsDecode(t *testing.T) {
+	type rootConfig struct {
+		DataDir    string          `yaml:"data_dir"`
+		RTDSDir    string          `yaml:"rtds_dir"`
+		BinanceDir string          `yaml:"binance_dir"`
+		Connector  yaml.Node       `yaml:"connector"`
+		Series     []SeriesConfig  `yaml:"series"`
+		Recording  RecordingConfig `yaml:"recording"`
+		RTDS       RTDSConfig      `yaml:"rtds"`
+		Binance    BinanceConfig   `yaml:"binance"`
+	}
+
+	for _, name := range []string{"collector.yaml", "collector_daily.yaml"} {
+		t.Run(name, func(t *testing.T) {
+			raw, err := os.ReadFile(filepath.Join("..", "..", "..", name))
+			if err != nil {
+				t.Skipf("config not readable from the test dir: %v", err)
+			}
+
+			var cfg rootConfig
+			dec := yaml.NewDecoder(bytes.NewReader(raw))
+			dec.KnownFields(true) // an unknown key is an error, not a silent no-op
+			if err := dec.Decode(&cfg); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+
+			if len(cfg.Series) == 0 {
+				t.Fatal("no series configured")
+			}
+			if anchor, err := cfg.Recording.Anchor(); err != nil {
+				t.Fatalf("recording.epoch: %v", err)
+			} else if anchor != libs.AnchorNoonET {
+				t.Errorf("anchor = %q, want noon_et", anchor)
+			}
+
+			// A scheduler built from this config must accept every series.
+			ec, _ := newTestCollector(t)
+			if _, err := NewEpochScheduler(ec, &stubDiscovery{},
+				SchedulerConfig{Recording: cfg.Recording, Series: cfg.Series}); err != nil {
+				t.Fatalf("NewEpochScheduler: %v", err)
+			}
+
+			// The settlement venue has to be recorded, or no market's outcome can
+			// be recomputed from our own data: every BTC family except 4h settles
+			// on a Binance BTC/USDT candle.
+			if len(cfg.Binance.Spot.Symbols) == 0 {
+				t.Error("binance spot is the settlement venue but is not recorded")
+			}
+
+			// ...and the Chainlink TWAP feed is the only settlement source the 4h
+			// family has.
+			for _, sc := range cfg.Series {
+				spec, err := libs.LookupSeriesByName(sc.Series)
+				if err != nil {
+					t.Errorf("series %q: %v", sc.Series, err)
+					continue
+				}
+				if spec.Source != libs.SettleChainlinkTWAP {
+					continue
+				}
+				if cfg.RTDS.ChainlinkTWAP == nil || !cfg.RTDS.ChainlinkTWAP.Enabled ||
+					len(cfg.RTDS.ChainlinkTWAP.Feeds) == 0 {
+					t.Errorf("%s resolves on the Chainlink TWAP but that feed is not enabled", spec.Name)
+				}
+			}
+		})
 	}
 }

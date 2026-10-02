@@ -4,3 +4,11 @@ data/
 # Build output
 bin/
 *.exe
+
+# Downloaded recordings
+download/
+
+# Local config overrides carrying real Polymarket credentials. The shipped
+# collector*.yaml files keep placeholders: supply the real config at deploy time
+# (./deploy.sh -config .tmp/collector_daily.local.yaml).
+.tmp/*.local.yaml

@@ -1,0 +1,109 @@
+# Collector configuration — records Polymarket BTC markets on a daily epoch
+# for DES backtest replay.
+#
+# Usage:
+#   go run ./cmd/collector -config collector_daily.yaml
+#   go run ./cmd/collector -config collector_daily.yaml -recording-dir ./data
+#
+# The schedule is daily: `recording.days` is how many daily epochs to record,
+# and every feed bucket and market recording is keyed to that same epoch.
+#
+# Polymarket API credentials (required for WebSocket connection).
+# You can get these from https://polymarket.com/profile/api
+#
+# These are placeholders on purpose: never commit real credentials. Supply the
+# live values at deploy time, either by editing a copy of this file outside git
+# or by keeping one in .tmp/*.local.yaml (gitignored) and running
+# `./deploy.sh -config .tmp/collector_daily.local.yaml`.
+connector:
+  api_key: "YOUR_POLYMARKET_API_KEY"
+  api_secret: "YOUR_POLYMARKET_API_SECRET"
+  api_passphrase: "YOUR_POLYMARKET_API_PASSPHRASE"
+  gamma_api_url: "https://gamma-api.polymarket.com"
+  market_ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  user_ws_url:   "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+  reconnect_interval_ms: 500
+  pending_flush_ms: 100
+
+# How long to record, and where the daily boundary sits.
+#
+#   days: 3                → epochs D0, D0+1, D0+2, then the run stops (the
+#                            ladder event of D0+3 is picked up during D0+2 but
+#                            never settles in-run, so it is written truncated)
+#   epoch: noon_et         → epoch D = [12:00 ET on D-1, 12:00 ET on D). This is
+#                            the default because three of the four families
+#                            settle on the 12:00 ET candle of their title date;
+#                            midnight_et exists for the deferred hit-price family
+#   ladder_offset_days: 1  → also hold the NEXT settlement day's ladder, so every
+#                            ladder event has a full pre-settlement history
+#
+# Boundaries are computed in America/New_York, so they follow DST.
+recording:
+  days: 3
+  epoch: noon_et
+  ladder_offset_days: 1
+
+# Market families to record, resolved through the series registry
+# (pkg/libs/series.go). The registry — not this file — holds the Gamma series
+# slug and the resolution rule, because those were verified against live Gamma;
+# a wrong entry here silently records the wrong market.
+#
+#   up/down   btc_1h   btc_4h   btc_1d      (1 market per event)
+#   ladder    btc_above (11 strike rungs)   btc_range (11 range buckets)
+#   deferred  btc_hit   (observes a whole ET day, settles at midnight — phase 3)
+#
+# strikes: ladder rungs to keep on each side of the spot price at session start;
+#          0 records every rung. Ignored by the up/down families.
+series:
+  - series: btc_1h
+  - series: btc_4h
+  - series: btc_1d
+  - series: btc_above
+    strikes: 3
+  - series: btc_range
+    strikes: 3
+
+# RTDS — Polymarket real-time reference price for the underlying asset
+# (~1/sec). Continuous; cut into epoch buckets, independent of market rotation.
+#   symbols: RTDS symbols, e.g. "btcusdt"; anything containing "/" is a
+#            Chainlink feed and is subscribed through the chainlink channel.
+# Output: data/rtds/[{chainlink_twap_}]{symbol}_{epochID}/events.gz + metadata.json
+#         (chainlink_twap folders are prefixed to avoid colliding with the same
+#         symbol recorded as a plain RTDS reference price)
+rtds:
+  crypto_prices:
+    enabled: true
+    symbols:
+      - btcusdt
+      - btc/usd #chainlink
+
+  chainlink_twap:
+    enabled: true
+    feeds:
+      - btc/usd
+    window: 60
+
+# Binance — HFT market data for the underlying asset, and the SETTLEMENT VENUE:
+# every BTC family except up/down-4h resolves on a Binance BTC/USDT candle, so
+# aggTrade *is* the settlement source. Each market's metadata names the bucket
+# its outcome can be recomputed from. Continuous; cut into epoch buckets.
+#   market:  "spot" (the settlement venue) or "perp" (only useful for basis)
+#   streams: "aggTrade"  every trade — the 1m settle candle is derived from it
+#            "depth"     top-20 @100ms
+#            "kline_5m"  FINAL candles only — the integrity cross-check for the
+#                        derived 1m candle
+# Output: data/binance/{market}/{symbol}_{epochID}/events.gz + metadata.json
+#         (the market directory is what keeps spot and perp apart — both record
+#         the same BTCUSDT symbol)
+binance:
+  spot:
+    symbols:
+      - BTCUSDT
+    streams:
+      - aggTrade
+      - depth
+      - kline_5m
+
+  perp:
+    symbols: ""
+    streams: []
