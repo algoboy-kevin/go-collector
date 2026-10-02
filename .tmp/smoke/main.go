@@ -34,7 +34,7 @@ import (
 
 	"github.com/algoboy-kevin/go-collector/pkg/libs"
 	"github.com/algoboy-kevin/go-collector/pkg/services/collector"
-	"github.com/algoboy-kevin/go-exchange-connector"
+	connector "github.com/algoboy-kevin/go-exchange-connector"
 	"github.com/algoboy-kevin/go-exchange-connector/pkg/binance"
 	"github.com/algoboy-kevin/go-exchange-connector/pkg/polymarket"
 	"gopkg.in/yaml.v3"
