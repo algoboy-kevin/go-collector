@@ -4,7 +4,8 @@ go 1.24.0
 
 require (
 	github.com/algoboy-kevin/go-des v0.1.5
-	github.com/algoboy-kevin/go-exchange-connector v0.6.0
+	github.com/algoboy-kevin/go-exchange-connector v0.7.1
+	github.com/coder/websocket v1.8.12
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -14,7 +15,6 @@ require (
 	github.com/StackExchange/wmi v1.2.1 // indirect
 	github.com/bits-and-blooms/bitset v1.20.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/coder/websocket v1.8.12 // indirect
 	github.com/consensys/gnark-crypto v0.18.1 // indirect
 	github.com/crate-crypto/go-eth-kzg v1.5.0 // indirect
 	github.com/deckarep/golang-set/v2 v2.6.0 // indirect

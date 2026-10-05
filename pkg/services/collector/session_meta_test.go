@@ -32,8 +32,12 @@ func newTestSession(t *testing.T, dir string, mc MarketContext) *RecordingSessio
 		Question:        "Bitcoin above ___ on October 2?",
 		ConditionID:     "0xabc",
 		MarketStartTime: sessNow,
-		// Far enough out that the synthetic-resolve timer never fires mid-test.
-		MarketEndTime: sessNow.Add(48 * time.Hour),
+		// Measured from the real clock, NOT from sessNow. The synthetic-resolve timer
+		// is scheduled at MarketEndTime + syntheticDelay, so anchoring this to the
+		// frozen fixture date made the suite expire: once real time passed
+		// 2026-10-04T06:31Z (sessNow + 48h + 1m) the timer fired immediately, resolving
+		// and finalizing sessions mid-test and racing every assertion below.
+		MarketEndTime: time.Now().Add(48 * time.Hour),
 	}, ec)
 	sess.SetMarketContext(mc)
 	// Finalize stops and nils the timer, so guard the cleanup.

@@ -1,0 +1,117 @@
+# hlrecorder configuration — raw Hyperliquid perpetual capture for DES/Nautilus replay.
+#
+# Usage:
+#   go run ./cmd/hlrecorder -config collector_hl.yaml            # run until signalled
+#   go run ./cmd/hlrecorder -config collector_hl.yaml -dry-run   # validate, print, exit
+#   go run ./cmd/hlrecorder -config collector_hl.yaml -duration 1h
+#   ./deploy-hl.sh -server root@IP -ssh-key ~/.ssh/id_ed25519
+#
+# Output, one file per channel per UTC hour:
+#   data/hyperliquid/{meta.json, manifest.json, <channel>/<YYYY-MM-DDTHH>.jsonl.gz}
+#
+# Each line is <rx_ns>\t<verbatim frame>\n: the local receive time in nanoseconds, a
+# TAB, and the frame exactly as received. Nothing is parsed, so a venue schema change
+# or a bug in this recorder cannot lose data — see RECORDER_SPEC.md for the file
+# contract and PERP_COLLECTOR_SPEC.md for the design.
+
+# Capture root. Subdirectories are created per channel. `data/` is gitignored.
+data_dir: data/hyperliquid
+
+# Coins to record. Bare venue symbols, NOT BTC-USD-PERP. Case matters at the venue:
+# "BTC" is valid and "btc" is not. Capitalisation is preserved deliberately, and a
+# coin containing whitespace, quotes or control characters is rejected — it is
+# interpolated into a JSON subscription frame, and that is the one injection surface.
+coins:
+  - BTC
+  - ETH
+  - SOL
+  - HYPE
+  - DOGE
+
+# Channels to record. Each channel gets its own WebSocket connection, because the
+# recorder never parses a frame and so cannot decide where a frame belongs by looking
+# at it: the destination has to be a property of the connection.
+#
+#   l2Book          required   depth snapshots, ~2/s per coin (a paced feed, not a delta)
+#   trades          required   the only source of aggressor side
+#   bbo             recommended top of book, per block on change (~4.7/s per coin measured)
+#   activeAssetCtx  recommended mark price, funding, open interest (~1/s per coin)
+#   allMids         optional   one global subscription, no coin argument
+#
+# `candle` is deliberately NOT allowed here even though the venue accepts it: bars are
+# useless for market making and would waste disk (RECORDER_SPEC.md §1).
+channels:
+  - l2Book
+  - trades
+  - bbo
+  - activeAssetCtx
+
+# l2Book thinning. `fast: true` asks for 5 book levels instead of 20 and roughly halves
+# the l2Book byte rate, which is the largest channel by volume.
+#
+# nSigFigs is deliberately left unset: it thins prices as well as levels, so it destroys
+# raw precision that a capture cannot get back. `mantissa` is only legal together with
+# nSigFigs: 5, so it stays unset too. Everything here is omitted from the subscription
+# frame when unset, so the venue's own defaults are what get recorded.
+l2Book:
+  fast: true
+
+connector:
+  ws_url: "wss://api.hyperliquid.xyz/ws"
+  info_url: "https://api.hyperliquid.xyz/info"
+  # perpDexs is only needed for HIP-3 (builder-deployed) markets: their asset ids are
+  # 100000 + dexIndex*10000 + indexInMeta, which meta.json alone cannot express.
+  record_perp_dexs: false
+
+recording:
+  # gzip level. default = 6, best_speed = 1, best = 9.
+  #
+  # This deliberately deviates from the Polymarket recorder's gzip.BestSpeed: CPU is
+  # ~99% idle on the target box while the disk is the scarce resource, and level 6
+  # retains ~30% more for ~0.27% of one core. Use best_speed if the universe ever grows
+  # past ~20 coins.
+  compression: default
+
+  # How often buffered frames are pushed to disk. This is the `kill -9` exposure: at
+  # most one interval of frames is lost, and the hour in progress stays readable.
+  flush_interval_ms: 1000
+
+  # Application-level {"method":"ping"}, which the venue answers with
+  # {"channel":"pong"}. Hyperliquid closes idle connections after ~60s, so this must
+  # stay below that. 0 selects the connector default (50s); a negative value disables
+  # it. Note it does NOT mean "disabled" — an idle socket with no keepalive is exactly
+  # what the venue closes.
+  ping_interval_ms: 50000
+
+  # WebSocket-level *control* ping. The pong watchdog (2x this interval) is what
+  # catches a half-open socket that still looks connected. 0 selects the connector
+  # default (20s); a negative value disables it.
+  ws_ping_interval_ms: 20000
+
+  # Pending frames per channel. Bounded on purpose: the queue is what keeps disk
+  # latency from throttling the read loop, and it is what makes memory flat in message
+  # count rather than in message rate. A full queue drops frames and records the count
+  # in manifest.json rather than blocking the connection.
+  queue_size: 8192
+
+  # Max bytes for a single WebSocket message. 0 selects the connector default (1 MiB),
+  # which is ~116x the largest frame measured live (a 9 KB trades burst). Leaving this
+  # at the default is fine; it is here so it can be lowered deliberately.
+  read_limit_bytes: 1048576
+
+  # Free-space floor for data_dir. Below it the recorder stops *cleanly*: the hour in
+  # progress is finished, fsynced and renamed, so the capture stays valid and complete
+  # instead of becoming a truncated file that looks whole. 500 MiB.
+  #
+  # 0 disables the guard (which is why this one is written explicitly rather than
+  # omitted — an absent key means "use the default", and the two must not be
+  # confusable).
+  min_free_bytes: 524288000
+
+  # Base reconnect delay, backing off to the connector's 30s ceiling. Keep this well
+  # away from zero: the venue allows 30 new connections per minute, so a fast retry on
+  # a venue-side outage would spend the budget on failed dials.
+  #
+  # There is deliberately no max-interval key: the connector pins that to the websocket
+  # default and exposes no override, so a key here would be a silent no-op.
+  reconnect_interval_ms: 500
