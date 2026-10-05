@@ -223,6 +223,20 @@ func TestClockRegressionNeverOverwritesAFinishedHour(t *testing.T) {
 	if got := w.ClockRegressions(); got != 1 {
 		t.Errorf("ClockRegressions = %d, want 1", got)
 	}
+	// The count alone cannot tell a millisecond blip from a real rewind, so the magnitude
+	// is recorded: hour13's frame is 30 minutes before hour14's start, so it falls short by
+	// exactly that much and the delta is negative.
+	samples := w.ClockRegressionSamples()
+	if len(samples) != 1 {
+		t.Fatalf("samples = %+v, want 1", samples)
+	}
+	if want := int64(-30 * time.Minute); samples[0].DeltaNS != want {
+		t.Errorf("DeltaNS = %d, want %d (negative: the clock was behind the open file)",
+			samples[0].DeltaNS, want)
+	}
+	if samples[0].AtNS != hour13.UnixNano() {
+		t.Errorf("AtNS = %d, want the frame's own receive time %d", samples[0].AtNS, hour13.UnixNano())
+	}
 	if got := w.FilesOpened(); got != 1 {
 		t.Errorf("FilesOpened = %d, want 1 — must not reopen an earlier bucket", got)
 	}
@@ -298,7 +312,10 @@ func TestStaleOpenFileIsPreservedNotTruncated(t *testing.T) {
 	}
 
 	rx := time.Date(2026, 10, 4, 14, 30, 0, 0, time.UTC)
-	w, err := NewHourlyWriter(WriterConfig{Root: root, Channel: "bbo", Compression: gzip.DefaultCompression})
+	w, err := NewHourlyWriter(WriterConfig{
+		Root: root, Channel: "bbo", Compression: gzip.DefaultCompression,
+		RunID: "2026-10-04T143000Z",
+	})
 	if err != nil {
 		t.Fatalf("NewHourlyWriter: %v", err)
 	}
@@ -313,8 +330,10 @@ func TestStaleOpenFileIsPreservedNotTruncated(t *testing.T) {
 		t.Fatalf("StaleFiles = %d, want 1", got)
 	}
 
-	// The irreplaceable bytes still exist, under a name that says why.
-	aside := final + TruncatedMarker + strconv.FormatInt(rx.UnixNano(), 10)
+	// The irreplaceable bytes still exist — but under quarantine/, not in the channel
+	// directory, because a preserved file sitting among real hour files reads as data to
+	// anyone doing `ls` while being invisible to anything that globs the channel.
+	aside := filepath.Join(root, QuarantineDir, "bbo", "2026-10-04T14."+QuarantinedTruncated+"-2026-10-04T143000Z"+BucketSuffix)
 	got, err := os.ReadFile(aside)
 	if err != nil {
 		t.Fatalf("stale .open bytes were destroyed: %v", err)
@@ -322,14 +341,36 @@ func TestStaleOpenFileIsPreservedNotTruncated(t *testing.T) {
 	if string(got) != "pre-crash bytes" {
 		t.Fatalf("stale bytes altered: %q", got)
 	}
-	// The preserved name must not look like a readable hour file, or an ingest that
-	// globs `*.jsonl.gz` would treat a crashed partial as a complete hour.
-	if strings.HasSuffix(aside, BucketSuffix) {
-		t.Fatalf("preserved name %q must not end in %q", filepath.Base(aside), BucketSuffix)
+	// The stale bytes must exist in exactly one place. The channel directory keeps only
+	// this run's own hour file, so nothing listed among the real hours is a leftover.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read channel dir: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != FileName("2026-10-04T14") {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("channel dir holds %v, want only the current hour file — a leftover here "+
+			"reads as real data to anyone listing it", names)
+	}
+
+	// The record is what makes the orphan findable: which hour, where it went, and that
+	// it was a truncation rather than a displacement.
+	recs := w.Quarantined()
+	if len(recs) != 1 {
+		t.Fatalf("quarantine records = %d, want 1", len(recs))
+	}
+	if recs[0].Kind != QuarantinedTruncated || recs[0].Hour != "2026-10-04T14" {
+		t.Errorf("record = %+v, want kind=truncated hour=2026-10-04T14", recs[0])
+	}
+	if want := filepath.Join(QuarantineDir, "bbo", filepath.Base(aside)); recs[0].PreservedAs != want {
+		t.Errorf("PreservedAs = %q, want %q", recs[0].PreservedAs, want)
 	}
 
 	// And the file that *is* claimed to be complete contains only this run's frame.
-	if lines := readLines(t, final); len(lines) != 1 || !strings.HasSuffix(lines[0], "\tX") {
+	if lines := readLines(t, filepath.Join(dir, FileName("2026-10-04T14"))); len(lines) != 1 || !strings.HasSuffix(lines[0], "\tX") {
 		t.Fatalf("new hour should hold only X, got %q", lines)
 	}
 }

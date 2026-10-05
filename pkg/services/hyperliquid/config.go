@@ -16,6 +16,31 @@ import (
 const (
 	DefaultDataDir      = "data/hyperliquid"
 	DefaultMinFreeBytes = 524288000 // 500 MiB
+
+	// DefaultReadLimitBytes caps a single WebSocket message at 16 MiB.
+	//
+	// The number that matters is the measured worst case, not a probe. A 2h capture on
+	// five mid-cap coins produced a single 126,590-byte `trades` frame, against 9,003
+	// bytes in the 60s probe that set the original 1 MiB default — a 14x growth in three
+	// hours of run time, on the channel PERP_COLLECTOR_SPEC.md itself flagged as the
+	// bursty one. At 1 MiB that is 8.3x of headroom, not the 116x the spec claimed, and one
+	// oversized frame kills the connection.
+	//
+	// 16 MiB is ~132x the worst frame seen and costs nothing but buffer: with the
+	// connector's read-limit failure handled as a per-connection reconnect, too high is
+	// cheap and too low is a hole in the capture. Treat
+	// `channel_reports[].largest_frame_bytes` as something to RE-MEASURE on every long
+	// run — the 14x growth is the evidence that this is not a settled venue property.
+	DefaultReadLimitBytes = 16 << 20
+
+	// DefaultAppPingMS is the application-level {"method":"ping"} interval.
+	//
+	// 25s, not the connector's 50s default. The venue closes an idle socket at ~60s, and
+	// the 2h capture measured the 50s interval as *exactly* 50.0s (72 pongs in an hour):
+	// 10s of margin against a 60s timer is not margin, it is one delayed write away from
+	// an avoidable reconnect. The WS-level control ping is not documented to reset the
+	// venue's application idle timer, so it does not make the longer interval safe.
+	DefaultAppPingMS = 25000
 )
 
 // Config is the YAML configuration for the hlrecorder binary.
@@ -30,6 +55,24 @@ type Config struct {
 	DataDir string `yaml:"data_dir"`
 
 	Coins []string `yaml:"coins"`
+
+	// DelistedPolicy decides what a configured coin that the venue lists but no longer
+	// trades does: "skip" (leave it out and record why), "record" (subscribe anyway) or
+	// "fail" (refuse to start). Empty selects "skip".
+	//
+	// A policy rather than a hard rule because both answers are legitimate — `skip` is
+	// right for a live capture, `record` is right for a study of the venue's silence on a
+	// dead market — and because the decision is recorded in the manifest either way.
+	DelistedPolicy string `yaml:"delisted_policy"`
+
+	// OnUniverseChange decides what happens when the capture root already holds a session
+	// with a DIFFERENT instrument set: "fail" (default) or "allow".
+	//
+	// It defaults to failing because a consumer derives one instrument set, and one price
+	// precision per coin, from a whole directory. Two universes in one directory does not
+	// raise an error — it produces a capture that looks complete and backtests at wrong
+	// prices. The remedy is a sibling root, which is a one-line change at deploy time.
+	OnUniverseChange string `yaml:"on_universe_change"`
 
 	// Channels is deliberately narrower than the venue's subscribable set: `candle`
 	// is subscribable but must not be recorded (RECORDER_SPEC.md §1 — bars are
@@ -72,9 +115,12 @@ type RecordingConfig struct {
 
 	// PingIntervalMS is the application-level {"method":"ping"} interval. The
 	// connector's convention, which this follows deliberately rather than inventing
-	// its own: 0 selects the library default of 50s, and a negative value disables
-	// the ping. A wrong guess here is not symmetric — 0 meaning "disabled" would
-	// leave an idle socket to be closed by the venue.
+	// its own: a negative value disables the ping, and 0 selects the recorder's default
+	// (DefaultAppPingMS, 25s) rather than the library's 50s.
+	//
+	// 0 does NOT mean "disabled": an idle socket with no keepalive is exactly what the
+	// venue closes at ~60s. The default was lowered from the library's 50s because 10s of
+	// margin on a 60s timer is not margin — see DefaultAppPingMS.
 	PingIntervalMS int64 `yaml:"ping_interval_ms"`
 
 	// WSPingIntervalMS is the WebSocket control-ping interval, whose pong watchdog
@@ -85,8 +131,12 @@ type RecordingConfig struct {
 	// QueueSize bounds the per-channel pending-frame queue.
 	QueueSize int `yaml:"queue_size"`
 
-	// ReadLimitBytes caps a single WebSocket message. 0 selects the library default
-	// of 1 MiB.
+	// ReadLimitBytes caps a single WebSocket message. 0 selects
+	// DefaultReadLimitBytes (16 MiB).
+	//
+	// Do not lower this without re-measuring: an oversized frame is not a dropped frame,
+	// it is a killed connection, and the venue's worst case grew 14x in three hours of
+	// run time. See DefaultReadLimitBytes.
 	ReadLimitBytes int64 `yaml:"read_limit_bytes"`
 
 	// MinFreeBytes is the free-space floor for DataDir. Below it the recorder stops
@@ -160,6 +210,19 @@ func (c *Config) Validate() error {
 	}
 	if len(c.Coins) == 0 {
 		errs = append(errs, errors.New("coins: at least one coin is required"))
+	}
+
+	switch c.DelistedPolicyOrDefault() {
+	case DelistedSkip, DelistedRecord, DelistedFail:
+	default:
+		errs = append(errs, fmt.Errorf("delisted_policy: %q is not one of %s, %s, %s",
+			c.DelistedPolicy, DelistedSkip, DelistedRecord, DelistedFail))
+	}
+	switch c.OnUniverseChangeOrDefault() {
+	case UniverseChangeFail, UniverseChangeAllow:
+	default:
+		errs = append(errs, fmt.Errorf("on_universe_change: %q is not one of %s, %s",
+			c.OnUniverseChange, UniverseChangeFail, UniverseChangeAllow))
 	}
 
 	// Channels.
@@ -297,6 +360,18 @@ type ChannelPlan struct {
 // applies the channel, coin and parameter rules, and SubscribeFrame builds the exact
 // bytes that go on the wire. A config that cannot produce a valid frame cannot start.
 func (c *Config) Plan() ([]ChannelPlan, error) {
+	return c.PlanFor(c.Coins)
+}
+
+// PlanFor is Plan against an explicit coin list.
+//
+// It exists because the policy decision happens later than the config is read: the
+// delisted-coin check needs the venue's universe, which needs a network call. So the
+// plans built at construction time may cover coins that are then dropped, and this is
+// how they are rebuilt. The subscription frame must match the coins actually recorded —
+// subscribing to a coin and refusing to write its frames is the one outcome worse than
+// not subscribing at all.
+func (c *Config) PlanFor(coins []string) ([]ChannelPlan, error) {
 	chans, err := c.channels()
 	if err != nil {
 		return nil, err
@@ -304,19 +379,19 @@ func (c *Config) Plan() ([]ChannelPlan, error) {
 	if len(chans) == 0 {
 		return nil, errors.New("channels: at least one channel is required")
 	}
-	if len(c.Coins) == 0 {
+	if len(coins) == 0 {
 		return nil, errors.New("coins: at least one coin is required")
 	}
 
 	plans := make([]ChannelPlan, 0, len(chans))
 	for _, ch := range chans {
-		coins := c.Coins
+		channelCoins := coins
 		if ch == hl.ChannelAllMids {
 			// allMids is global and takes no coin.
-			coins = nil
+			channelCoins = nil
 		}
 
-		subs, err := hl.BuildSubscriptions(ch, coins, c.SubParamsFor(ch))
+		subs, err := hl.BuildSubscriptions(ch, channelCoins, c.SubParamsFor(ch))
 		if err != nil {
 			return nil, fmt.Errorf("channel %s: %w", ch, err)
 		}
@@ -343,6 +418,50 @@ func (c *Config) SubParamsFor(ch hl.Channel) hl.SubParams {
 		}
 	}
 	return hl.SubParams{}
+}
+
+// Universe-change policies, for `on_universe_change` in the config.
+const (
+	// UniverseChangeFail refuses to record into a root whose existing capture describes
+	// different instruments. The default.
+	UniverseChangeFail = "fail"
+	// UniverseChangeAllow records anyway, for a deliberate merge the operator owns.
+	UniverseChangeAllow = "allow"
+)
+
+// DelistedPolicyOrDefault returns the effective delisted-coin policy.
+func (c *Config) DelistedPolicyOrDefault() string {
+	if v := strings.ToLower(strings.TrimSpace(c.DelistedPolicy)); v != "" {
+		return v
+	}
+	return DelistedSkip
+}
+
+// OnUniverseChangeOrDefault returns the effective universe-change policy.
+func (c *Config) OnUniverseChangeOrDefault() string {
+	if v := strings.ToLower(strings.TrimSpace(c.OnUniverseChange)); v != "" {
+		return v
+	}
+	return UniverseChangeFail
+}
+
+// ReadLimit returns the effective per-message read limit. An unset key selects
+// DefaultReadLimitBytes rather than the connector's 1 MiB default.
+func (c *Config) ReadLimit() int64 {
+	if c.Recording.ReadLimitBytes == 0 {
+		return DefaultReadLimitBytes
+	}
+	return c.Recording.ReadLimitBytes
+}
+
+// AppPingIntervalMS returns the effective application ping interval. An unset key
+// selects DefaultAppPingMS rather than the connector's 50s default; a negative value
+// disables the ping.
+func (c *Config) AppPingIntervalMS() int64 {
+	if c.Recording.PingIntervalMS == 0 {
+		return DefaultAppPingMS
+	}
+	return c.Recording.PingIntervalMS
 }
 
 // CompressionLevel maps the configured name onto a gzip level.
@@ -392,8 +511,8 @@ func (c *Config) Options() hl.Options {
 	}
 	// 0 means "library default" for each of these, so only non-zero values are
 	// forwarded. The library treats a negative value as "disabled".
-	opts.ReadLimitBytes = c.Recording.ReadLimitBytes
-	opts.AppPingIntervalMs = c.Recording.PingIntervalMS
+	opts.ReadLimitBytes = c.ReadLimit()
+	opts.AppPingIntervalMs = c.AppPingIntervalMS()
 	opts.WSPingIntervalMs = c.Recording.WSPingIntervalMS
 	return opts
 }

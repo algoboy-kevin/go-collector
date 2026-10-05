@@ -3,6 +3,7 @@ package hyperliquid
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -32,8 +33,22 @@ func TestShippedConfigDecodes(t *testing.T) {
 	if got, want := len(cfg.Coins), 5; got != want {
 		t.Errorf("coins = %d, want %d", got, want)
 	}
-	if got, want := cfg.Coins[0], "BTC"; got != want {
-		t.Errorf("first coin = %q, want %q (case is significant at the venue)", got, want)
+	// Asset names must survive decoding exactly. The venue matches them literally, so a
+	// lowercased coin or a stripped dex prefix is a different — or a non-existent —
+	// market, and the failure mode is a closed connection rather than an error.
+	for _, want := range []string{"SOL", "HYPE", "DOGE", "xyz:JP225", "vntl:OPENAI"} {
+		if !slices.Contains(cfg.Coins, want) {
+			t.Errorf("shipped coins %v are missing %q", cfg.Coins, want)
+		}
+	}
+	// The shipped config deliberately exercises HIP-3, so its dex grouping must produce
+	// three universes to dump: the default dex, plus vntl and xyz.
+	groups := GroupCoinsByDex(cfg.Coins)
+	if len(groups) != 3 {
+		t.Errorf("GroupCoinsByDex = %+v, want 3 dexes (default, vntl, xyz)", groups)
+	}
+	if len(cfg.Channels) < 2 {
+		t.Errorf("channels = %v, want more than one", cfg.Channels)
 	}
 	for _, ch := range cfg.Channels {
 		if ch == string(hl.ChannelCandle) {

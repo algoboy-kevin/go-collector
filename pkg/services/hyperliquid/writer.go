@@ -23,8 +23,12 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -46,8 +50,19 @@ const (
 	TruncatedMarker = ".open.truncated-"
 
 	// ReplacedMarker appears in the name of a *completed* hour that a new run would
-	// otherwise have renamed over. Nothing that globs for hour files matches it.
+	// otherwise have renamed over.
 	ReplacedMarker = ".replaced-"
+
+	// QuarantineDir is the capture subdirectory holding files the recorder refused to
+	// overwrite. It is deliberately NOT part of the time series: nothing under it is a
+	// current hour, and a reader that walks the capture must exclude it by name.
+	//
+	// It exists because "preserved" used to mean "left in the channel directory under a
+	// name that does not look like data" — which made the artifact invisible to a
+	// consumer while looking like data to a human reading `ls`. Naming it by its own hour
+	// and tagging it with the run that displaced it makes both the range and the cause
+	// recoverable.
+	QuarantineDir = "quarantine"
 
 	defaultBufSize  = 64 << 10 // 64 KiB, per PERP_COLLECTOR_SPEC.md §6.3
 	defaultFileMode = 0o644
@@ -102,6 +117,66 @@ type WriterConfig struct {
 
 	// FileMode is the permission for newly created files. Zero selects 0644.
 	FileMode os.FileMode
+
+	// RunID tags any file this writer preserves, so a quarantined hour names the run that
+	// displaced it. Empty in tests that do not care.
+	RunID string
+}
+
+// QuarantineKind distinguishes why a file was preserved.
+const (
+	// QuarantinedReplaced is a *complete* hour that a new run would have renamed over.
+	QuarantinedReplaced = "replaced"
+	// QuarantinedTruncated is an `.open` file from a process that died inside the hour.
+	QuarantinedTruncated = "truncated"
+)
+
+// maxClockRegressionSamples bounds the recorded samples. The COUNT is always exact; the
+// samples are evidence, and a pathological clock could produce millions of them, which
+// would turn a diagnostic into the largest structure in the process.
+const maxClockRegressionSamples = 32
+
+// ClockRegression is one frame whose receive time was earlier than the hour of the file
+// that was open. The count says it happened; the magnitude says whether it mattered.
+type ClockRegression struct {
+	AtNS int64 `json:"at_ns"`
+	// DeltaNS is how far the frame fell short of the open file's hour start, so it is
+	// negative: -50ms is a blip, -40s is a rewind worth investigating.
+	DeltaNS int64 `json:"delta_ns"`
+}
+
+// QuarantineRecord describes one preserved file.
+//
+// The point of the record — rather than the bare count this replaced — is that a hole in
+// the timeline can be attributed: which hour, which file holds the surviving bytes, and
+// what range they cover. A count says an hour was displaced but not where it went.
+type QuarantineRecord struct {
+	Kind string `json:"kind"`
+	// Hour is the bucket the preserved file covers, e.g. "2026-10-05T08". It is the name
+	// the file earned when it was written, NOT the instant it was displaced.
+	Hour string `json:"hour"`
+	// PreservedAs is the path relative to the capture root.
+	PreservedAs string `json:"preserved_as"`
+	// Lines, FirstNS and LastNS describe the surviving bytes. They are read back from the
+	// quarantined file once, at quarantine time: without them the reader has to guess
+	// whether the orphan covers seconds or most of an hour.
+	Lines   int   `json:"lines,omitempty"`
+	FirstNS int64 `json:"first_ns,omitempty"`
+	LastNS  int64 `json:"last_ns,omitempty"`
+}
+
+// FileRecord describes one completed hour file, so the manifest can answer "which hours
+// exist, are they empty, and are they the bytes I have" without opening any of them.
+type FileRecord struct {
+	Name    string `json:"name"`
+	Lines   int    `json:"lines"`
+	Bytes   int64  `json:"bytes"`
+	FirstNS int64  `json:"first_ns,omitempty"`
+	LastNS  int64  `json:"last_ns,omitempty"`
+	// SHA256 is the digest of the file's bytes as written. The capture is irreplaceable and
+	// lives on one box; without this, verifying a copy means reading both the original and
+	// the copy.
+	SHA256 string `json:"sha256,omitempty"`
 }
 
 // HourlyWriter appends raw frames to one gzip file per UTC hour.
@@ -118,6 +193,9 @@ type WriterConfig struct {
 type HourlyWriter struct {
 	cfg WriterConfig
 	dir string
+	// quarantineDir holds files this writer refuses to overwrite. One per channel, so a
+	// quarantined `trades` file can never be confused with a quarantined `l2Book` one.
+	quarantineDir string
 
 	bucket string // current bucket, "" when no file is open
 	file   *os.File
@@ -133,6 +211,16 @@ type HourlyWriter struct {
 	replacedHours    int
 	newlineFrames    int
 	clockRegressions int
+	// clockRegressionSamples holds the first few rewinds with their magnitude.
+	clockRegressionSamples []ClockRegression
+
+	// Per-file accounting, reset on every rotate and turned into a FileRecord on close.
+	curLines   int
+	curFirstNS int64
+	curLastNS  int64
+
+	files      []FileRecord
+	quarantine []QuarantineRecord
 }
 
 // NewHourlyWriter creates a writer for one channel and ensures its directory exists.
@@ -160,11 +248,39 @@ func NewHourlyWriter(cfg WriterConfig) (*HourlyWriter, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("hyperliquid: create %s: %w", dir, err)
 	}
-	return &HourlyWriter{cfg: cfg, dir: dir}, nil
+	// Created up front so quarantining can never be the thing that fails: preserving an
+	// existing file must not depend on a directory that is only needed when it happens.
+	qdir := filepath.Join(cfg.Root, QuarantineDir, cfg.Channel)
+	if err := os.MkdirAll(qdir, 0o755); err != nil {
+		return nil, fmt.Errorf("hyperliquid: create %s: %w", qdir, err)
+	}
+	return &HourlyWriter{cfg: cfg, dir: dir, quarantineDir: qdir}, nil
+}
+
+// Files returns a record of every completed hour file, oldest first. Safe to read once
+// the writer is closed; before that it covers only the files already rotated out.
+func (w *HourlyWriter) Files() []FileRecord { return append([]FileRecord(nil), w.files...) }
+
+// Quarantined returns a record of every file preserved rather than overwritten.
+func (w *HourlyWriter) Quarantined() []QuarantineRecord {
+	return append([]QuarantineRecord(nil), w.quarantine...)
 }
 
 // Dir returns the directory this writer writes into.
 func (w *HourlyWriter) Dir() string { return w.dir }
+
+// QuarantineDir returns the directory preserved files are moved into.
+func (w *HourlyWriter) QuarantineDir() string { return w.quarantineDir }
+
+// CurrentName returns the final name of the hour file being written, or "" if none is
+// open. It is used to say *which* file a write error happened on, in the error mark
+// written into the stream.
+func (w *HourlyWriter) CurrentName() string {
+	if w.bucket == "" {
+		return ""
+	}
+	return FileName(w.bucket)
+}
 
 // Bucket returns the current UTC-hour bucket, or "" before the first frame.
 func (w *HourlyWriter) Bucket() string { return w.bucket }
@@ -186,6 +302,12 @@ func (w *HourlyWriter) FilesOpened() int { return w.filesOpened }
 // prefixes will be outside the file's hour. Rare, and worth reporting rather than
 // hiding.
 func (w *HourlyWriter) ClockRegressions() int { return w.clockRegressions }
+
+// ClockRegressionSamples returns the first few rewinds with their magnitude. The count
+// from ClockRegressions is exact even when more than maxClockRegressionSamples happened.
+func (w *HourlyWriter) ClockRegressionSamples() []ClockRegression {
+	return append([]ClockRegression(nil), w.clockRegressionSamples...)
+}
 
 // StaleFiles returns how many `.open` files left behind by an earlier process this
 // writer had to move aside. Non-zero means a previous run died mid-hour.
@@ -241,6 +363,18 @@ func (w *HourlyWriter) Write(rx time.Time, frame []byte) error {
 			// write into the current file instead: the frame survives, its rx_ns prefix
 			// still records the true receive time, and the anomaly is counted.
 			w.clockRegressions++
+			if len(w.clockRegressionSamples) < maxClockRegressionSamples {
+				var delta int64
+				// Measured against the START of the hour the open file covers, so the number
+				// reads as "the clock was this far behind where the file already was".
+				if start, perr := time.ParseInLocation(BucketLayout, w.bucket, time.UTC); perr == nil {
+					delta = rx.UnixNano() - start.UnixNano()
+				}
+				w.clockRegressionSamples = append(w.clockRegressionSamples, ClockRegression{
+					AtNS:    rx.UnixNano(),
+					DeltaNS: delta,
+				})
+			}
 		}
 	}
 
@@ -266,6 +400,15 @@ func (w *HourlyWriter) Write(rx time.Time, frame []byte) error {
 	if bytes.IndexByte(frame, '\n') >= 0 {
 		w.newlineFrames++
 	}
+
+	// Per-file accounting for the manifest's files[]. Every line counts, sentinels
+	// included: they are bytes in the file like any other, and a reader comparing line
+	// counts must not be surprised by them.
+	w.curLines++
+	if w.curFirstNS == 0 {
+		w.curFirstNS = rx.UnixNano()
+	}
+	w.curLastNS = rx.UnixNano()
 	return nil
 }
 
@@ -323,11 +466,8 @@ func (w *HourlyWriter) rotate(rx time.Time, bucket string) error {
 	// an unterminated gzip member, so a second member behind it would corrupt the
 	// first.
 	if _, err := os.Lstat(tmp); err == nil {
-		// The preserved name deliberately does not end in `.jsonl.gz`, so nothing that
-		// globs for hour files will mistake a crashed partial for a complete hour.
-		aside := final + TruncatedMarker + strconv.FormatInt(rx.UnixNano(), 10)
-		if err := os.Rename(tmp, aside); err != nil {
-			return fmt.Errorf("hyperliquid: preserve stale %s: %w", tmp, err)
+		if err := w.quarantineFile(tmp, bucket, QuarantinedTruncated, w.cfg.RunID); err != nil {
+			return err
 		}
 		w.staleFiles++
 	}
@@ -335,11 +475,10 @@ func (w *HourlyWriter) rotate(rx time.Time, bucket string) error {
 	// A *complete* hour already at the destination: a previous run finished this hour,
 	// and this one has started inside the same hour. Renaming at close would replace
 	// those bytes with this run's, silently destroying them — the same failure as a
-	// backwards clock step, reached by a different route. Preserve and count instead.
+	// backwards clock step, reached by a different route. Preserve and record instead.
 	if _, err := os.Lstat(final); err == nil {
-		aside := final + ReplacedMarker + strconv.FormatInt(rx.UnixNano(), 10)
-		if err := os.Rename(final, aside); err != nil {
-			return fmt.Errorf("hyperliquid: preserve existing %s: %w", final, err)
+		if err := w.quarantineFile(final, bucket, QuarantinedReplaced, w.cfg.RunID); err != nil {
+			return err
 		}
 		w.replacedHours++
 	}
@@ -360,7 +499,87 @@ func (w *HourlyWriter) rotate(rx time.Time, bucket string) error {
 	w.buf = buf
 	w.gz = gz
 	w.filesOpened++
+	w.curLines, w.curFirstNS, w.curLastNS = 0, 0, 0
 	return nil
+}
+
+// quarantineFile moves a file out of the channel directory into quarantine, naming it by
+// the hour it covers and the run that displaced it, and records what it contains.
+//
+// The name it gets encodes the OLD file's hour on purpose. The previous scheme appended
+// the instant of the move — which reads as information about the displaced file but is
+// actually the first receive time of the file that replaced it. The thing a reader needs
+// when reconciling a hole is the orphan's own range, so that is what the record carries.
+func (w *HourlyWriter) quarantineFile(src, hour, kind, runID string) error {
+	if runID == "" {
+		runID = "unknown"
+	}
+	name := hour + "." + kind + "-" + runID + BucketSuffix
+	dst := filepath.Join(w.quarantineDir, name)
+
+	// Record before the move is attempted: if the rename then fails the caller aborts the
+	// hour, and a manifest that claims a file which was not actually preserved would be
+	// worse than one that omits it.
+	if err := os.Rename(src, dst); err != nil {
+		return fmt.Errorf("hyperliquid: quarantine %s: %w", src, err)
+	}
+
+	rec := QuarantineRecord{
+		Kind:        kind,
+		Hour:        hour,
+		PreservedAs: filepath.Join(QuarantineDir, w.cfg.Channel, name),
+	}
+	// Best effort: the file is preserved either way, and a truncated gzip member is
+	// exactly the case this tolerates. Failing the run here would lose the very data the
+	// quarantine exists to keep.
+	lines, first, last, err := inspectGzip(dst)
+	if err != nil {
+		slog.Warn("hyperliquid: quarantine contents not measured",
+			"file", dst, "err", err)
+	} else {
+		rec.Lines, rec.FirstNS, rec.LastNS = lines, first, last
+	}
+	w.quarantine = append(w.quarantine, rec)
+	return nil
+}
+
+// inspectGzip reports how many lines a file holds and the first and last receive times.
+//
+// It tolerates a truncated member, because that is what a crashed `.open` file is, and
+// the whole point is to describe it rather than to refuse it.
+func inspectGzip(path string) (lines int, firstNS, lastNS int64, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer func() { _ = f.Close() }()
+
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer func() { _ = zr.Close() }()
+
+	sc := bufio.NewScanner(zr)
+	sc.Buffer(make([]byte, 0, 64<<10), 8<<20)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if i := bytes.IndexByte(line, '\t'); i > 0 {
+			if ns, convErr := strconv.ParseInt(string(line[:i]), 10, 64); convErr == nil {
+				if firstNS == 0 {
+					firstNS = ns
+				}
+				lastNS = ns
+			}
+		}
+		lines++
+	}
+	// A truncated member surfaces here as an unexpected EOF. The lines already counted
+	// are real, so only a genuine read failure is reported.
+	if err := sc.Err(); err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		return lines, firstNS, lastNS, err
+	}
+	return lines, firstNS, lastNS, nil
 }
 
 // closeCurrent finishes and renames the open file, if there is one.
@@ -387,12 +606,48 @@ func (w *HourlyWriter) closeCurrent() error {
 		tmp := final + OpenSuffix
 		if err := os.Rename(tmp, final); err != nil {
 			firstErr = fmt.Errorf("hyperliquid: rename %s: %w", tmp, err)
+		} else {
+			rec := FileRecord{
+				Name:    FileName(w.bucket),
+				Lines:   w.curLines,
+				FirstNS: w.curFirstNS,
+				LastNS:  w.curLastNS,
+			}
+			if info, statErr := os.Stat(final); statErr == nil {
+				rec.Bytes = info.Size()
+			}
+			// Hashed after the rename, so the digest describes the finished, readable file
+			// — the one a copy is compared against. Best effort: a capture is not made
+			// less valid by a missing checksum, and failing the close here would be a
+			// worse trade than an absent field.
+			if sum, hashErr := hashFile(final); hashErr != nil {
+				slog.Warn("hyperliquid: could not hash closed hour", "file", final, "err", hashErr)
+			} else {
+				rec.SHA256 = sum
+			}
+			w.files = append(w.files, rec)
 		}
 	}
 
 	w.file, w.buf, w.gz = nil, nil, nil
 	w.bucket = ""
 	return firstErr
+}
+
+// hashFile returns the hex sha256 of a file's bytes. The manifest records it so a copy
+// can be verified by reading the copy alone.
+func hashFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // checkPathComponent rejects anything that would let a config value escape its

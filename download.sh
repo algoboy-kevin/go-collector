@@ -1,13 +1,29 @@
 #!/usr/bin/env bash
 #
-# Download the remote go-collector data/ folder to a local out-dir.
-# The remote data folder contains subfolders (market/, binance/, rtds/) which
-# land directly inside the given out-dir. Shows progress for each file.
+# Download the remote capture folders to a local out-dir.
+#
+# There are TWO captures on the server, written by two binaries into two directories,
+# and this script fetches either or both:
+#
+#   polymarket   /root/go-collector/data     (cmd/collector)  -> binance/ market/ rtds/
+#   hyperliquid  /root/go-hlrecorder/data    (cmd/hlrecorder) -> hyperliquid/
+#
+# Each tree's contents land directly inside the out-dir, so fetching both into one place
+# cannot collide: out-dir/{binance,market,rtds} plus out-dir/hyperliquid/.
+#
+# A tree that is not deployed is skipped with a warning when both are requested; naming
+# one explicitly and finding it missing is an error.
+#
+# The Hyperliquid capture is written continuously, so it can contain `.open` files —
+# the current, still-unrolling UTC hour. That is normal: the final `.jsonl.gz` name
+# appears only once the hour is closed and fsynced.
 #
 # Usage:
-#   ./download.sh -server root@YOUR.IP.GOES.HERE -ssh-key ~/.ssh/id_ed25519 -out-dir ./download
+#   ./download.sh -server root@YOUR.IP.GOES.HERE -ssh-key ~/.ssh/id_ed25519 \
+#                 [-out-dir ./download] [-source polymarket|hyperliquid|both]
 #
-# Required: -server and -ssh-key. Optional: -out-dir (default ./download).
+# Required: -server and -ssh-key. Optional: -out-dir (default ./download),
+# -source (default both).
 
 set -euo pipefail
 
@@ -16,7 +32,12 @@ set -euo pipefail
 SERVER="YOUR.IP.GOES.HERE"
 SSH_KEY=""
 OUT_DIR="./download"
-REMOTE_DATA_DIR="/root/go-collector/data"
+SOURCE="both"
+
+# The two captures live in separate remote directories by design: deploy-hl.sh keeps its
+# own tree so it can never `rm -rf` the Polymarket one (see that script's header).
+REMOTE_PM_DATA_DIR="/root/go-collector/data"
+REMOTE_HL_DATA_DIR="/root/go-hlrecorder/data"
 
 # ── Parse flags ──────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -27,9 +48,11 @@ while [[ $# -gt 0 ]]; do
       SSH_KEY="$2"; shift 2 ;;
     -out-dir)
       OUT_DIR="$2"; shift 2 ;;
+    -source)
+      SOURCE="$2"; shift 2 ;;
     *)
       echo "Unknown flag: $1" >&2
-      echo "Usage: $0 -server root@YOUR.IP.GOES.HERE -ssh-key ~/.ssh/id_ed25519 -out-dir ./download" >&2
+      echo "Usage: $0 -server root@YOUR.IP.GOES.HERE -ssh-key ~/.ssh/id_ed25519 [-out-dir ./download] [-source polymarket|hyperliquid|both]" >&2
       exit 1 ;;
   esac
 done
@@ -43,20 +66,68 @@ if [[ -z "$SSH_KEY" ]]; then
   echo "Error: -ssh-key is required (e.g. -ssh-key ~/.ssh/id_ed25519)" >&2
   exit 1
 fi
+case "$SOURCE" in
+  polymarket|hyperliquid|both) ;;
+  *)
+    echo "Error: -source must be polymarket, hyperliquid or both (got '$SOURCE')" >&2
+    exit 1 ;;
+esac
 
-# ── 1. Show what is on the server first ─────────────────────────────────────
-echo "==> Remote contents of $SERVER:$REMOTE_DATA_DIR ..."
-ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o BatchMode=yes "$SERVER" \
-  "find $REMOTE_DATA_DIR -type f | sort"
+# ── Helpers ──────────────────────────────────────────────────────────────────
+ssh_() { ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o BatchMode=yes "$@"; }
+scp_() { scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -o BatchMode=yes "$@"; }
 
-# ── 2. Download ─────────────────────────────────────────────────────────────
+# download_tree <label> <remote-dir> <required>
+#   required=1 -> a missing remote dir is an error (this source was named explicitly)
+#   required=0 -> a missing remote dir is skipped, so `both` still works on a host that
+#                 runs only one of the two binaries
+#
+download_tree() {
+  local label="$1" remote="$2" required="$3"
+
+  # `test -d` is the condition of an `if`, so an absent directory is handled here rather
+  # than aborting the script under `set -e`.
+  if ! ssh_ "$SERVER" "test -d '$remote'"; then
+    if [[ "$required" == 1 ]]; then
+      echo "Error: $remote does not exist on $SERVER — $label is not deployed there." >&2
+      exit 1
+    fi
+    echo "==> Skipping $label: $remote does not exist on $SERVER."
+    return 0
+  fi
+
+  echo "==> $label: remote contents of $SERVER:$remote ..."
+  ssh_ "$SERVER" "find '$remote' -type f | sort"
+
+  # The "/." trick copies the *contents* of the remote directory rather than the
+  # directory itself, so each tree lands directly inside OUT_DIR. scp prints a progress
+  # meter per file.
+  echo "==> $label: downloading $remote -> $OUT_DIR ..."
+  scp_ -r "$SERVER:$remote/." "$OUT_DIR/"
+}
+
+# ── Fail fast on an unreachable host ─────────────────────────────────────────
+# Done before the per-tree checks, because otherwise a bad key or a dead host would be
+# reported as "not deployed" for both trees — a misleading diagnosis of a real problem.
+if ! ssh_ "$SERVER" true; then
+  echo "Error: cannot SSH to $SERVER with key $SSH_KEY." >&2
+  exit 1
+fi
+
+# ── Download ─────────────────────────────────────────────────────────────────
 mkdir -p "$OUT_DIR"
-echo "==> Downloading $SERVER:$REMOTE_DATA_DIR -> $OUT_DIR ..."
-# The "/." trick copies the contents of data/ (market, binance, rtds, ...)
-# directly into OUT_DIR. scp prints a progress meter per file so we can track
-# each downloaded file.
-scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -o BatchMode=yes \
-  -r "$SERVER:$REMOTE_DATA_DIR/." "$OUT_DIR/"
+
+if [[ "$SOURCE" == "polymarket" || "$SOURCE" == "both" ]]; then
+  required=0
+  if [[ "$SOURCE" == "polymarket" ]]; then required=1; fi
+  download_tree "polymarket" "$REMOTE_PM_DATA_DIR" "$required"
+fi
+
+if [[ "$SOURCE" == "hyperliquid" || "$SOURCE" == "both" ]]; then
+  required=0
+  if [[ "$SOURCE" == "hyperliquid" ]]; then required=1; fi
+  download_tree "hyperliquid" "$REMOTE_HL_DATA_DIR" "$required"
+fi
 
 echo "==> Done. Files downloaded to: $OUT_DIR"
 echo "    $(find "$OUT_DIR" -type f | wc -l | tr -d ' ') file(s) local."

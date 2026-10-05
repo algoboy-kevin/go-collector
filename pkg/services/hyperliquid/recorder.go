@@ -23,6 +23,12 @@ const (
 	StopDiskLow       = "disk_low"
 	StopWriteError    = "write_error"
 	StopStartupFailed = "startup_failed"
+	// StopConnectionFlap means the recorder gave up on a channel that kept reconnecting
+	// without ever delivering a frame. The connector now backs such a connection off to
+	// its 30s ceiling, so this is no longer about protecting the venue's connection
+	// budget — it is the decision the backoff deliberately never makes: give up rather
+	// than reconnect politely forever.
+	StopConnectionFlap = "connection_flap"
 )
 
 const (
@@ -34,6 +40,20 @@ const (
 	// DefaultAckWait is how long to wait for subscription acknowledgements before
 	// reporting a shortfall. The venue acks within a second in practice.
 	DefaultAckWait = 10 * time.Second
+	// DefaultFlapThreshold is how many reconnects a channel may make without receiving a
+	// single frame before the recorder stops.
+	//
+	// A dial that *succeeds* and is then closed by the venue — a refused subscription, an
+	// IP over its connection limit, a policy close — used to reset the connector's
+	// reconnect backoff, so it retried at the base interval forever: measured at 719
+	// connections in three minutes, straight through the venue's per-IP limit, while
+	// capturing nothing. go-exchange-connector v0.7.2 fixed that storm itself (a
+	// connection that dies inside MinStableConnectionMs now escalates the backoff instead
+	// of resetting it), so the venue's budget is no longer what this guards. What is left
+	// is the decision a backoff never makes: with a 30s ceiling the loop would reconnect
+	// politely forever on a channel that has *never* produced a frame, and a capture that
+	// will never contain anything is worth ending rather than keeping alive.
+	DefaultFlapThreshold = 15
 )
 
 // ackPrefix identifies a subscription acknowledgement frame.
@@ -75,6 +95,9 @@ type RecorderConfig struct {
 
 	// MetaOptions overrides DefaultMetaOptions.
 	MetaOptions MetaOptions
+
+	// FlapThreshold overrides DefaultFlapThreshold.
+	FlapThreshold int64
 }
 
 // Recorder captures every frame the venue sends for the configured channels.
@@ -91,6 +114,8 @@ type Recorder struct {
 	conns     []*channelConn
 	sinks     map[hl.Channel]*Sink
 	startedAt time.Time
+	// runID is the run's identity, stamped into every manifest and every `_meta` line.
+	runID string
 
 	startFree atomic.Int64
 	endFree   atomic.Int64
@@ -108,16 +133,34 @@ type channelConn struct {
 	sink *Sink
 	ws   *hl.WSHyperliquid
 	plan ChannelPlan
+	// runID is the owning run's identity, stamped into this channel's sentinels.
+	runID string
 
 	acks    atomic.Int64
 	largest atomic.Int64
 	lastRx  atomic.Int64
+
+	// connects counts every successful dial, including reconnects. A healthy channel
+	// stays at 1 for the whole run.
+	connects atomic.Int64
+	// connectsSinceProgress counts reconnects since the channel last received a frame,
+	// and is what the flap detector watches.
+	connectsSinceProgress atomic.Int64
+	framesAtLastCheck     atomic.Int64
 
 	sidesMu sync.Mutex
 	sides   map[string]int64
 
 	errMu  sync.Mutex
 	errors []string
+
+	// disconnectMu guards lastDisconnect: the reason for the most recent unexpected
+	// drop, exactly as the connector reported it. onDisconnect sets it immediately
+	// before onStatus writes the `disconnected` sentinel — the connector invokes the
+	// disconnect hook before the status callback, on the same goroutine — so the
+	// sentinel and the manifest always agree.
+	disconnectMu   sync.Mutex
+	lastDisconnect string
 }
 
 // NewRecorder validates the configuration and builds the sinks, so a bad data
@@ -158,6 +201,9 @@ func NewRecorder(opts RecorderConfig) (*Recorder, error) {
 	if opts.MetaOptions.Attempts <= 0 {
 		opts.MetaOptions = DefaultMetaOptions()
 	}
+	if opts.FlapThreshold <= 0 {
+		opts.FlapThreshold = DefaultFlapThreshold
+	}
 
 	r := &Recorder{
 		cfg:      cfg,
@@ -167,10 +213,21 @@ func NewRecorder(opts RecorderConfig) (*Recorder, error) {
 		sinks:    make(map[hl.Channel]*Sink, len(plans)),
 	}
 
+	// The run's identity is fixed here, at construction, not in Start: the sinks need it
+	// when they are built, and they are built next. cmd/hlrecorder constructs and starts
+	// in one breath, so the difference is microseconds — and the alternative, deriving it
+	// twice, could straddle a second boundary and produce two ids for one run.
+	r.startedAt = r.opts.Now()
+	r.runID = uniqueRunID(cfg.DataDir, RunID(r.startedAt))
+
 	// Sinks first: connections must have somewhere to put a frame the instant they
 	// deliver one.
 	for _, plan := range plans {
-		sink, err := NewSink(cfg.SinkConfigFor(plan.Channel, compression))
+		sinkCfg := cfg.SinkConfigFor(plan.Channel, compression)
+		// The sink stamps this into the `dropped`/`write_error` marks it writes itself,
+		// so those lines identify their run like every other sentinel.
+		sinkCfg.RunID = r.runID
+		sink, err := NewSink(sinkCfg)
 		if err != nil {
 			r.closeSinks()
 			return nil, err
@@ -214,27 +271,72 @@ func (r *Recorder) Err() error {
 // Run calls it; call it directly only if you intend to drive the shutdown sequence
 // yourself.
 func (r *Recorder) Start(ctx context.Context) error {
-	r.startedAt = r.opts.Now()
-
+	// runID and startedAt were fixed at construction (see NewRecorder); the sinks already
+	// carry this run's identity in the marks they write themselves.
 	// Free space before anything is written, for the manifest's before/after pair.
 	r.startFree.Store(r.freeSpace())
 
-	// meta.json before any frame: a capture with no instrument definitions is
-	// unusable, and this is irreplaceable data rather than a nicety.
-	if err := FetchMeta(ctx, r.opts.Info, r.cfg.DataDir, r.opts.MetaOptions); err != nil {
+	// Instrument metadata before any frame, and the configured coins checked against
+	// the venue's own universe. A capture with no instrument definitions is unusable,
+	// and a coin the venue does not know is not an error it reports — it closes the
+	// connection, which without this check becomes a reconnect storm that captures
+	// nothing.
+	dumps, err := FetchStartupMeta(ctx, r.opts.Info, r.cfg.DataDir, r.cfg.Coins, r.opts.MetaOptions)
+	if err != nil {
 		return err
 	}
+	slog.Info("hyperliquid: instrument metadata captured",
+		"default_assets", dumps.DefaultAssets,
+		"hip3_dexes", len(dumps.Dexes),
+		"detail", dumps.Describe(),
+	)
 	if r.cfg.Connector.RecordPerpDexs {
-		// Best effort: only HIP-3 markets need it, so it must not fail the run.
+		// Best effort: the dex *list* is informational, and only some consumers need it.
+		// The per-dex universes above are not optional, and are already written.
 		if err := FetchPerpDexs(ctx, r.opts.Info, r.cfg.DataDir, r.opts.MetaOptions); err != nil {
 			slog.Warn("hyperliquid: perpDexs dump failed", "err", err)
 		}
 	}
 
+	// Narrow the coin list to what will actually be recorded. The venue keeps a delisted
+	// market in its universe and still accepts the subscription, so this is not a safety
+	// check — it is a decision, and it has to happen here because it needs the universe,
+	// which needs a network call. The meta dumps above are deliberately NOT narrowed with
+	// it: a skipped coin's instrument definition stays in the capture, so the decision is
+	// reversible from the manifest rather than from a re-fetch.
+	coins, skipped, err := ApplyDelistedPolicy(r.cfg.Coins, dumps.Universes, r.cfg.DelistedPolicyOrDefault())
+	if err != nil {
+		return err
+	}
+	if len(coins) == 0 {
+		return fmt.Errorf("hyperliquid: every configured coin was skipped (%s); nothing to record", r.cfg.DelistedPolicyOrDefault())
+	}
+	if len(coins) != len(r.cfg.Coins) {
+		// Rebuild the subscriptions: the frames on the wire must match the coins whose
+		// frames we intend to keep.
+		plans, perr := r.cfg.PlanFor(coins)
+		if perr != nil {
+			return perr
+		}
+		r.plans = plans
+	}
+
+	// What decides the instrument set, digested. Compared against earlier runs so two
+	// experiments cannot silently share a directory — see checkUniverseChange.
+	fingerprint := UniverseFingerprint(coins, r.cfg.Channels, l2Params(r.cfg), dumps.Metas)
+	if err := r.checkUniverseChange(fingerprint); err != nil {
+		return err
+	}
+
 	// The manifest is written now and rewritten at shutdown, so a capture that is
 	// killed mid-run still says what it was trying to do.
-	m := r.cfg.ManifestHeader(r.startedAt, r.compress)
+	m := r.cfg.ManifestHeader(r.startedAt, r.runID, r.compress)
 	m.Recording.FreeBytesAtStart = r.startFree.Load()
+	m.Hip3Dexes = dumps.Dexes
+	m.Coins = CoinRefsFor(coins)
+	m.CoinsSkipped = skipped
+	m.UniverseFingerprint = fingerprint
+	m.MetaSHA256 = dumps.MetaSHA256
 	if err := WriteManifest(r.cfg.DataDir, m); err != nil {
 		return err
 	}
@@ -248,6 +350,7 @@ func (r *Recorder) Start(ctx context.Context) error {
 			ch:    plan.Channel,
 			sink:  r.sinks[plan.Channel],
 			plan:  plan,
+			runID: r.runID,
 			sides: map[string]int64{},
 		}
 
@@ -258,6 +361,10 @@ func (r *Recorder) Start(ctx context.Context) error {
 		cc.ws.SetRawFrameHandler(cc.onRawFrame)
 		cc.ws.SetDispatcher(cc.onEvent)
 		cc.ws.SetOnStatusChange(cc.onStatus)
+		// SetOnDisconnect carries WHY the connection dropped; SetOnStatusChange reports
+		// only *that* it did. The connector calls the disconnect hook first, so the
+		// reason is in place before onStatus writes the `disconnected` sentinel.
+		cc.ws.SetOnDisconnect(cc.onDisconnect)
 
 		// Subscribe before dialling so that the first connect already has the
 		// subscriptions registered. The manager re-sends the registry on every
@@ -308,7 +415,7 @@ func (r *Recorder) Run(ctx context.Context) error {
 	// 2. Mark the end of the stream in each channel's own file. Written after the
 	// connections stop so it is genuinely last, and before the sinks stop so it is
 	// flushed like any other line.
-	r.writeSentinel(EventStopped)
+	r.writeSentinel(Sentinel{Event: EventStopped})
 
 	// 3. Drain the queues, finish the gzip streams, fsync, and rename `.open` to the
 	// final name. This is what turns a partial hour into a readable one.
@@ -376,6 +483,13 @@ func (r *Recorder) supervise(ctx context.Context) error {
 					"err", err,
 				)
 				r.setStop(StopDiskLow, err)
+				return err
+			}
+			if err := r.checkFlap(); err != nil {
+				slog.Error("hyperliquid: stopping, a channel keeps reconnecting without delivering frames",
+					"err", err,
+				)
+				r.setStop(StopConnectionFlap, err)
 				return err
 			}
 			if err := r.writeError(); err != nil {
@@ -460,6 +574,99 @@ func (r *Recorder) checkQuiet() {
 	}
 }
 
+// checkUniverseChange refuses to record into a capture root whose earlier runs describe
+// different instruments.
+//
+// A consumer builds ONE instrument set, and one price precision per coin, from a whole
+// directory. Two universes in one directory does not raise an error — it produces a
+// capture that looks complete and backtests at the wrong prices, because the precision
+// derived from one session's prices is applied to the other's records.
+//
+// The comparison is against the NEWEST run that recorded a fingerprint. Runs from before
+// the field existed, and runs that died before writing one, are skipped rather than read
+// as a mismatch: an absent fingerprint is not evidence of a different universe.
+func (r *Recorder) checkUniverseChange(fingerprint string) error {
+	if r.cfg.OnUniverseChangeOrDefault() == UniverseChangeAllow {
+		slog.Warn("hyperliquid: on_universe_change is allow; earlier runs are not checked",
+			"dir", r.cfg.DataDir)
+		return nil
+	}
+
+	existing, err := ReadManifests(r.cfg.DataDir)
+	if err != nil {
+		// Fail open, deliberately. An unreadable *historical* manifest must not stop a
+		// recording run: blocking would lose data that cannot be refetched, whereas the
+		// contamination risk this guards against is visible in the manifest this run writes
+		// and in the warning below.
+		slog.Warn("hyperliquid: cannot read earlier manifests, universe not checked",
+			"dir", r.cfg.DataDir, "err", err)
+		return nil
+	}
+
+	for i := len(existing) - 1; i >= 0; i-- {
+		prev := existing[i]
+		if prev.UniverseFingerprint == "" {
+			continue
+		}
+		if prev.UniverseFingerprint == fingerprint {
+			slog.Info("hyperliquid: continuing an existing capture",
+				"dir", r.cfg.DataDir,
+				"first_run", existing[0].RunID,
+				"previous_run", prev.RunID,
+				"runs", len(existing))
+			return nil
+		}
+		return fmt.Errorf(
+			"hyperliquid: %s already holds a capture with different instruments "+
+				"(run %s, %s; this run is %s). Recording both into one directory would blend "+
+				"two universes, and a consumer derives one instrument set and one price "+
+				"precision per coin from the whole directory — so the result backtests at the "+
+				"wrong prices without erroring. Use a sibling root for the new universe "+
+				"(e.g. %s-<label>), or set on_universe_change: allow if the merge is deliberate",
+			r.cfg.DataDir, prev.RunID, prev.UniverseFingerprint, fingerprint, r.cfg.DataDir)
+	}
+	return nil
+}
+
+// checkFlap stops the run when a channel has reconnected repeatedly without ever
+// receiving a frame.
+//
+// This is a behavioural guard, not a diagnosis: the recorder cannot tell a refused
+// subscription from a network path that drops anything long-lived, so it counts
+// reconnects-since-the-last-frame and treats a channel that has never produced one as
+// not going to. The connector's own backoff (v0.7.2, MinStableConnectionMs) already
+// stops such a connection from being retried at the base interval forever, so the
+// failure this prevents is no longer a storm but a permanently empty capture.
+//
+// The reason the connector reports for the most recent drop is included in the error
+// when there is one, so the usual suspects (a coin that is not in the dex's universe, an
+// IP over its connection limit, a refused subscription) are named rather than guessed.
+//
+// The threshold counts reconnects *since the last frame*, so a channel that worked for
+// hours and then hit a network blip is not punished for it.
+func (r *Recorder) checkFlap() error {
+	for _, cc := range r.conns {
+		frames := cc.sink.Frames()
+		if frames > cc.framesAtLastCheck.Load() {
+			cc.framesAtLastCheck.Store(frames)
+			cc.connectsSinceProgress.Store(0)
+		}
+		if n := cc.connectsSinceProgress.Load(); n >= r.opts.FlapThreshold {
+			msg := fmt.Sprintf("channel %s reconnected %d times without receiving a frame "+
+				"(largest frame seen: %d bytes, acks: %d of %d)",
+				cc.ch, n, cc.largest.Load(), cc.acks.Load(), len(cc.plan.Subscriptions))
+			if reason := cc.lastDisconnectReason(); reason != "" {
+				msg += "; the venue said: " + reason
+			} else {
+				msg += " — check the coins against the venue's universe, or whether this IP " +
+					"is over its connection limit"
+			}
+			return errors.New(msg)
+		}
+	}
+	return nil
+}
+
 // checkDisk reports an error when free space in the capture directory has fallen below
 // the configured floor.
 //
@@ -533,20 +740,21 @@ func (r *Recorder) closeSinks() error {
 //
 // A sentinel belongs to its own channel's file only: connections are independent, so a
 // drop on `trades` is a hole in `trades` and nothing else.
-func (r *Recorder) writeSentinel(event string) {
+func (r *Recorder) writeSentinel(s Sentinel) {
+	s.RunID = r.runID
 	now := r.opts.Now()
 	for _, plan := range r.plans {
 		sink, ok := r.sinks[plan.Channel]
 		if !ok {
 			continue
 		}
-		line, err := SentinelLine(event, now)
+		line, err := SentinelLine(s, now)
 		if err != nil {
-			slog.Error("hyperliquid: build sentinel", "event", event, "err", err)
+			slog.Error("hyperliquid: build sentinel", "event", s.Event, "err", err)
 			continue
 		}
 		if !sink.EnqueueSentinel(now, line) {
-			slog.Error("hyperliquid: sentinel dropped", "channel", plan.Channel, "event", event)
+			slog.Error("hyperliquid: sentinel dropped", "channel", plan.Channel, "event", s.Event)
 		}
 	}
 }
@@ -556,6 +764,12 @@ func (r *Recorder) writeSentinel(event string) {
 // already on disk.
 func (r *Recorder) writeFinalManifest() {
 	m := r.Manifest()
+	if m.RunID == "" {
+		// A run that died before the opening manifest was written still has to leave a
+		// record: a failed startup is exactly the case where "what was it even trying to
+		// do" matters, and the header costs nothing.
+		m = r.cfg.ManifestHeader(r.startedAt, r.runID, r.compress)
+	}
 	m.EndedNS = r.opts.Now().UnixNano()
 	m.StopReason = r.StopReason()
 	if err := r.Err(); err != nil {
@@ -604,17 +818,27 @@ func (r *Recorder) channelReports() []ChannelReport {
 		rep.StaleFiles = sink.StaleFiles()
 		rep.ReplacedHours = sink.ReplacedHours()
 		rep.ClockRegressions = sink.ClockRegressions()
+		rep.ClockRegressionSamples = sink.ClockRegressionSamples()
 		rep.FramesWithNewline = sink.FramesContainingNewline()
+		rep.Files = sink.Files()
+		rep.Quarantined = sink.Quarantined()
 		if err := sink.Err(); err != nil {
 			rep.Error = err.Error()
+		}
+		if first := sink.FirstFrame(); !first.IsZero() {
+			rep.FirstFrameNS = first.UnixNano()
 		}
 		if last := sink.LastFrame(); !last.IsZero() {
 			rep.LastFrameNS = last.UnixNano()
 		}
+		rep.MaxGapMS = sink.MaxGap().Milliseconds()
 
 		if cc, ok := byChannel[plan.Channel]; ok {
 			rep.Acks = cc.acks.Load()
+			rep.Reconnects = cc.connects.Load() - 1 // the first dial is not a reconnect
+			rep.ConnectAttempts = cc.connects.Load()
 			rep.LargestFrame = cc.largest.Load()
+			rep.LastDisconnect = cc.lastDisconnectReason()
 			cc.sidesMu.Lock()
 			if len(cc.sides) > 0 {
 				rep.TradeSides = make(map[string]int64, len(cc.sides))
@@ -708,26 +932,77 @@ func (c *channelConn) onEvent(ev any) {
 // onStatus writes the connection sentinel into this channel's file.
 //
 // The connector fires this from inside OnConnect — after the resubscribe frames and
-// before the read loop starts — so a `resubscribed` line is always enqueued before any
-// frame from that connection can be. And a deliberate Stop suppresses the hook, so a
-// `disconnected` line means an unexpected drop and nothing else.
+// before the read loop starts — so a `subscribed`/`resubscribed` line is always enqueued
+// before any frame from that connection can be. And a deliberate Stop suppresses the
+// hook, so a `disconnected` line means an unexpected drop and nothing else.
+//
+// The FIRST connect emits `subscribed`, not `resubscribed`. A consumer counting
+// `resubscribed` as "this channel reconnected" is then correct without special-casing the
+// first connect — which is exactly what the 2h capture got wrong: `reconnects: 0` in the
+// manifest, but one `resubscribed` per channel for the ingest to count.
 func (c *channelConn) onStatus(st ws.ConnectionStatus) {
 	now := time.Now()
 	switch st {
 	case ws.StatusConnected:
-		c.enqueueSentinel(EventResubscribed, now)
+		if n := c.connects.Add(1); n > 1 {
+			// A reconnect. Counted until a frame arrives, so the flap detector can tell
+			// "this connection is being refused" from "this market is quiet".
+			c.connectsSinceProgress.Add(1)
+			c.enqueueSentinel(Sentinel{Event: EventResubscribed}, now)
+		} else {
+			c.enqueueSentinel(Sentinel{Event: EventSubscribed}, now)
+		}
 	case ws.StatusDisconnected:
-		c.enqueueSentinel(EventDisconnected, now)
+		// onDisconnect ran first, so the reason is the one for this drop.
+		c.enqueueSentinel(Sentinel{Event: EventDisconnected, Reason: c.lastDisconnectReason()}, now)
 	}
 }
 
-func (c *channelConn) enqueueSentinel(event string, now time.Time) {
-	line, err := SentinelLine(event, now)
+// onDisconnect records why a connection dropped.
+//
+// The connector invokes this immediately before the status callback, so the reason is
+// already in place when onStatus writes the `disconnected` sentinel: the channel's file
+// and the manifest carry the same words. SetOnStatusChange alone cannot do this — it
+// reports only *that* the connection dropped, never why (that gap was
+// PERP_COLLECTOR_SPEC.md §8 item 8, closed by go-exchange-connector v0.7.2).
+//
+// The reason is logged as well, because a log is what a live operator reads; but the
+// capture has to stand on its own, since the log is gone by the time anyone asks.
+func (c *channelConn) onDisconnect(err error) {
+	reason := DisconnectReason(err)
+	c.setLastDisconnect(reason)
+	if reason == "" {
+		// A deliberate shutdown suppresses this path, so an unexplained drop is rare:
+		// the socket went away without the venue saying anything.
+		slog.Warn("hyperliquid: channel disconnected", "channel", c.ch, "reason", "unreported")
+		return
+	}
+	slog.Warn("hyperliquid: channel disconnected", "channel", c.ch, "reason", reason)
+}
+
+// setLastDisconnect records the reason for the most recent unexpected drop.
+func (c *channelConn) setLastDisconnect(reason string) {
+	c.disconnectMu.Lock()
+	c.lastDisconnect = reason
+	c.disconnectMu.Unlock()
+}
+
+// lastDisconnectReason returns the most recent drop's reason, or "" if nothing has
+// dropped unexpectedly.
+func (c *channelConn) lastDisconnectReason() string {
+	c.disconnectMu.Lock()
+	defer c.disconnectMu.Unlock()
+	return c.lastDisconnect
+}
+
+func (c *channelConn) enqueueSentinel(s Sentinel, now time.Time) {
+	s.RunID = c.runID
+	line, err := SentinelLine(s, now)
 	if err != nil {
-		slog.Error("hyperliquid: build sentinel", "channel", c.ch, "event", event, "err", err)
+		slog.Error("hyperliquid: build sentinel", "channel", c.ch, "event", s.Event, "err", err)
 		return
 	}
 	if !c.sink.EnqueueSentinel(now, line) {
-		slog.Error("hyperliquid: sentinel dropped", "channel", c.ch, "event", event)
+		slog.Error("hyperliquid: sentinel dropped", "channel", c.ch, "event", s.Event)
 	}
 }

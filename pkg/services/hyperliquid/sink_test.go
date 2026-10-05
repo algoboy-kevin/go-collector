@@ -2,6 +2,7 @@ package hyperliquid
 
 import (
 	"compress/gzip"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -20,6 +21,7 @@ func newTestSink(t *testing.T, channel string, queueSize int, flushEvery time.Du
 		Compression: gzip.DefaultCompression,
 		QueueSize:   queueSize,
 		FlushEvery:  flushEvery,
+		RunID:       "2026-10-04T140000Z",
 	})
 	if err != nil {
 		t.Fatalf("NewSink: %v", err)
@@ -234,6 +236,56 @@ func TestEnqueueAfterStopIsCountedNotSilentlyLost(t *testing.T) {
 // ─────────────────────────────────────────────────────────────
 // Durability and failure
 // ─────────────────────────────────────────────────────────────
+
+func TestDroppedFramesLeaveAMarkInTheStream(t *testing.T) {
+	// The manifest counts drops, but the consumer reads the stream and never opens the
+	// manifest — so a hole in the book had no cause in the data at all. The mark has to be
+	// written by the writer goroutine, because the queue being full is exactly the
+	// condition under which a mark sent through that queue would be dropped too.
+	s, root := newTestSink(t, "bbo", 4, 10*time.Millisecond)
+	rx := time.Date(2026, 10, 4, 14, 0, 0, 0, time.UTC)
+
+	const burst = 400
+	for i := 0; i < burst; i++ {
+		s.Enqueue(rx, []byte("frame"))
+	}
+	if err := s.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if s.Drops() == 0 {
+		t.Fatal("a 400-frame burst cannot have fit in a 4-deep queue")
+	}
+
+	var markedCount int64
+	var markedRun string
+	for _, line := range readLines(t, singleHourFile(t, filepath.Join(root, "bbo"))) {
+		if !strings.Contains(line, `"event":"`+EventDropped+`"`) {
+			continue
+		}
+		tab := strings.IndexByte(line, '\t')
+		if tab <= 0 {
+			t.Fatalf("mark is not <rx_ns>\\t<json>: %q", line)
+		}
+		var body struct {
+			Count int64  `json:"count"`
+			RunID string `json:"run_id"`
+		}
+		if err := json.Unmarshal([]byte(line[tab+1:]), &body); err != nil {
+			t.Fatalf("dropped mark is not JSON: %v (%s)", err, line)
+		}
+		if body.Count < markedCount {
+			t.Errorf("count went backwards: %d after %d", body.Count, markedCount)
+		}
+		markedCount, markedRun = body.Count, body.RunID
+	}
+	if markedCount != s.Drops() {
+		t.Errorf("the stream reports %d dropped frames, the sink counted %d — the hole and "+
+			"the count must agree", markedCount, s.Drops())
+	}
+	if markedRun != "2026-10-04T140000Z" {
+		t.Errorf("the mark's run_id = %q, want the sink's run", markedRun)
+	}
+}
 
 func TestFlushTimerMakesTheCurrentHourReadableMidWrite(t *testing.T) {
 	// The property: `kill -9` costs at most one flush interval, so the hour being

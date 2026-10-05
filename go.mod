@@ -4,7 +4,7 @@ go 1.24.0
 
 require (
 	github.com/algoboy-kevin/go-des v0.1.5
-	github.com/algoboy-kevin/go-exchange-connector v0.7.1
+	github.com/algoboy-kevin/go-exchange-connector v0.7.2
 	github.com/coder/websocket v1.8.12
 	gopkg.in/yaml.v3 v3.0.1
 )

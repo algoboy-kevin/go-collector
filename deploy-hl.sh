@@ -110,12 +110,17 @@ go run ./cmd/hlrecorder -config "$CONFIG_NAME" -dry-run > /dev/null
 echo "    config is valid"
 
 # ── 2. Refuse to run twice ───────────────────────────────────────────────────
-running="$(ssh -i "$SSH_KEY" "${SSH_OPTS[@]}" "$SERVER" "pgrep -fc hlrecorder 2>/dev/null || true" | tr -d '[:space:]')"
+# The bracket in '[h]lrecorder' is load-bearing, not cosmetics. Over ssh this runs inside a
+# shell whose own command line contains the pattern, so a plain `pgrep -f hlrecorder` matches
+# the checking shell and always reports one process — a guard that fires every single time.
+# '[h]lrecorder' still matches the string "hlrecorder" in another process's argv, but the
+# shell's own argv contains the literal brackets, which the pattern does not match.
+running="$(ssh -i "$SSH_KEY" "${SSH_OPTS[@]}" "$SERVER" "pgrep -fc '[h]lrecorder' 2>/dev/null || true" | tr -d '[:space:]')"
 if [[ -n "$running" && "$running" != "0" ]]; then
   if [[ "$FORCE" != "1" ]]; then
     echo "Error: hlrecorder is already running on $SERVER ($running process(es))." >&2
     echo "       Two recorders would fight over the same hour file." >&2
-    echo "       Stop it first:  ssh -i $SSH_KEY $SERVER 'pkill -f hlrecorder'" >&2
+    echo "       Stop it first:  ssh -i $SSH_KEY $SERVER \"pkill -f '[h]lrecorder'\"" >&2
     echo "       Or pass -force if you know what you are doing." >&2
     exit 1
   fi
@@ -169,5 +174,5 @@ ssh -i "$SSH_KEY" "${SSH_OPTS[@]}" "$SERVER" "tail -n 20 $REMOTE_LOG"
 echo
 echo "==> Done. Recorder running in the background on $SERVER."
 echo "    tail -f:      ssh -i $SSH_KEY $SERVER 'tail -f $REMOTE_LOG'"
-echo "    stop:         ssh -i $SSH_KEY $SERVER 'pkill -f hlrecorder'"
+echo "    stop:         ssh -i $SSH_KEY $SERVER \"pkill -f '[h]lrecorder'\""
 echo "    capture:      $REMOTE_DATA_DIR  (use download.sh to fetch it)"
