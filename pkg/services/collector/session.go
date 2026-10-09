@@ -8,12 +8,14 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/algoboy-kevin/go-collector/pkg/libs"
 	connector "github.com/algoboy-kevin/go-exchange-connector"
+	"github.com/algoboy-kevin/go-exchange-connector/pkg/websocket"
 )
 
 // RecordingSession buffers events for a single market and manages its
@@ -50,15 +52,26 @@ type RecordingSession struct {
 	totalGapMs   int64
 	gapWindows   [][2]int64
 
-	// Last book snapshot (raw Data) per asset — used for synthetic midprice
-	// resolution, replacing the old scan of the full buffered event list.
-	lastYesBook []byte
-	lastNoBook  []byte
+	// Live top-of-book per outcome token. A full book_snapshot replaces both
+	// sides; a price_change carries the exchange's own BBO for the levels that
+	// moved and keeps the book current between the (rare) snapshots. Used for
+	// synthetic midprice resolution in place of the last stored snapshot, which
+	// could be hours old even while price_change events kept the book current.
+	yesBBO topOfBook
+	noBBO  topOfBook
 
-	// lastBookAt is the received-at time (unix ms) of the most recent book
-	// snapshot for either side. A synthetic resolve only trusts a book that is
-	// still fresh at the settlement instant; 0 means no book was ever seen.
+	// lastBookAt is the received-at time (unix ms) of the most recent top-of-
+	// book update for either side — a book_snapshot OR a price_change carrying
+	// that asset's BBO. A synthetic resolve only trusts a book that is still
+	// fresh at the settlement instant; 0 means no book data was ever seen. A
+	// quiet market on a healthy connection stays fresh because its
+	// price_change events refresh this, not just its snapshots.
 	lastBookAt int64
+
+	// disconnectWindows are the session's market-WS down intervals, derived
+	// from connEvents at finalize. A tail that overlaps one is a real data
+	// loss; a tail on a healthy connection is just a quiet market.
+	disconnectWindows [][2]int64
 
 	// connEvents records the market-WS connection status changes received while
 	// this session was recording. Per-session stats are derived from it rather
@@ -125,6 +138,12 @@ func newRecordingSession(cfg SessionConfig, collector *EventCollector) *Recordin
 	s.syntheticTimer = time.AfterFunc(time.Until(closeTime.Add(delay)), func() {
 		s.handleSyntheticResolve()
 	})
+
+	// Seed the connection log with the state the session was born into. A
+	// session created while the market WS is already down would otherwise never
+	// see the "disconnected" callback (it fired before the session existed) and
+	// would undercount its own downtime.
+	s.seedInitialConnectionState()
 
 	slog.Info("collector: session started",
 		"market", cfg.MarketID,
@@ -238,20 +257,36 @@ func (s *RecordingSession) writeEventLocked(ev RecordedEvent) error {
 	}
 	s.prevTs = ev.Timestamp
 
-	// Keep the latest book snapshot per asset for synthetic midprice
-	// resolution (book_snapshot events are large; only the last one matters),
-	// and remember when it arrived so a synthetic resolve can reject a book
-	// that had already gone stale by the settlement instant.
+	// Keep the live top-of-book per asset for synthetic midprice resolution:
+	// a book_snapshot is a full ladder (authoritative — it replaces both
+	// sides), and a price_change carries the exchange's own BBO for the levels
+	// it touched. Either refreshes lastBookAt, so a market whose book is kept
+	// current only by price_change events is still fresh at settlement.
 	if ev.Type == "book_snapshot" {
 		var snap connector.BookSnapshotEvent
 		if err := json.Unmarshal(ev.Data, &snap); err == nil {
 			switch snap.AssetID {
 			case s.cfg.YesAssetID:
-				s.lastYesBook = append(s.lastYesBook[:0], ev.Data...)
+				s.yesBBO.setFromLevels(snap.Bids, snap.Asks)
 				s.noteBookAtLocked(ev.ReceivedAt)
 			case s.cfg.NoAssetID:
-				s.lastNoBook = append(s.lastNoBook[:0], ev.Data...)
+				s.noBBO.setFromLevels(snap.Bids, snap.Asks)
 				s.noteBookAtLocked(ev.ReceivedAt)
+			}
+		}
+	}
+	if ev.Type == "price_change" {
+		var pc connector.PriceChangeEvent
+		if err := json.Unmarshal(ev.Data, &pc); err == nil {
+			for _, ch := range pc.Changes {
+				switch ch.AssetID {
+				case s.cfg.YesAssetID:
+					s.yesBBO.updateFromChange(ch.BestBid, ch.BestAsk)
+					s.noteBookAtLocked(ev.ReceivedAt)
+				case s.cfg.NoAssetID:
+					s.noBBO.updateFromChange(ch.BestBid, ch.BestAsk)
+					s.noteBookAtLocked(ev.ReceivedAt)
+				}
 			}
 		}
 	}
@@ -267,26 +302,28 @@ func (s *RecordingSession) noteBookAtLocked(at int64) {
 }
 
 // closeEventStream flushes/closes the events.gz file, classifies broker gaps
-// against disconnect windows, and returns the final data-quality stats.
-func (s *RecordingSession) closeEventStream() (*GapInfo, *ConnectionInfo, error) {
+// against disconnect windows, and returns the final data-quality stats plus the
+// session's own market-WS down intervals (used to decide the tail-truncation
+// flag).
+func (s *RecordingSession) closeEventStream() (*GapInfo, *ConnectionInfo, [][2]int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.gz != nil {
 		if err := s.gz.Close(); err != nil {
 			_ = s.f.Close()
-			return nil, nil, fmt.Errorf("gzip close: %w", err)
+			return nil, nil, nil, fmt.Errorf("gzip close: %w", err)
 		}
 		s.gz = nil
 	}
 	if s.f != nil {
 		if err := s.f.Close(); err != nil {
-			return nil, nil, fmt.Errorf("file close: %w", err)
+			return nil, nil, nil, fmt.Errorf("file close: %w", err)
 		}
 		s.f = nil
 	}
 	if s.count == 0 {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 
 	// Per-session disconnect stats: the status callbacks that fell inside this
@@ -299,6 +336,7 @@ func (s *RecordingSession) closeEventStream() (*GapInfo, *ConnectionInfo, error)
 	}
 	disconnectWindows := buildDisconnectWindows(connEvents)
 	connInfo := computeConnectionInfo(connEvents)
+	s.disconnectWindows = disconnectWindows
 
 	gi := &GapInfo{
 		BrokerTimestampGaps: int(s.gapCount),
@@ -319,7 +357,7 @@ func (s *RecordingSession) closeEventStream() (*GapInfo, *ConnectionInfo, error)
 			gi.InactivityGaps++
 		}
 	}
-	return gi, connInfo, nil
+	return gi, connInfo, disconnectWindows, nil
 }
 
 // RecordConnection accumulates a market-WS connection status change that
@@ -339,6 +377,25 @@ func (s *RecordingSession) RecordConnection(status string, at time.Time) {
 		Status:    status,
 		Timestamp: at.UnixMilli(),
 	})
+}
+
+// seedInitialConnectionState records the market WS status the session was
+// created under. If the WS is already disconnected, that opens a disconnect
+// window at the session's start: a later "connected" callback closes it and the
+// downtime is counted, instead of the session reporting zero disconnects
+// because the disconnect callback fired before it existed.
+func (s *RecordingSession) seedInitialConnectionState() {
+	status, ok := s.collector.marketStatus()
+	if !ok {
+		return
+	}
+	switch status {
+	case websocket.StatusConnected, websocket.StatusDisconnected:
+		s.connEvents = append(s.connEvents, ConnectionEvent{
+			Status:    string(status),
+			Timestamp: s.startedAt.UnixMilli(),
+		})
+	}
 }
 
 // EventCount returns the number of recorded events.  Thread-safe.
@@ -493,7 +550,7 @@ func (s *RecordingSession) Finalize() error {
 	s.mu.Unlock()
 
 	// Close the streaming events.gz and finalize the gap/latency stats.
-	gi, connInfo, err := s.closeEventStream()
+	gi, connInfo, disconnectWindows, err := s.closeEventStream()
 	if err != nil {
 		return fmt.Errorf("finalize %s: %w", s.cfg.MarketID, err)
 	}
@@ -509,16 +566,21 @@ func (s *RecordingSession) Finalize() error {
 	// Tail gap: how much of the window the feed actually covers. It only means
 	// something once the window has ended, so it is computed when the settlement
 	// instant is in the past. A recording whose last event predates settlement
-	// by more than the silence timeout is incomplete — flag it truncated. But
-	// never at the cost of a real outcome: a resolution that arrived is
-	// authoritative, and an early-resolved hit market legitimately stops trading
-	// long before its anchor.
+	// by more than the silence timeout is incomplete — but only when the gap is
+	// explained by a real outage (a market-WS disconnect, or a whole-feed
+	// silence the watchdog recorded); a quiet wing strike on a healthy
+	// connection legitimately goes minutes without an event and must not be
+	// flagged. Never at the cost of a real outcome: a resolution that arrived is
+	// authoritative, and an early-resolved hit market stops trading long before
+	// its anchor.
 	if gi != nil && gi.EndTimestamp > 0 && endTime.Before(time.Now()) {
-		if tail := endTime.UnixMilli() - gi.EndTimestamp; tail > 0 {
-			gi.LastEventTs = gi.EndTimestamp
+		tailStart := gi.EndTimestamp
+		tailEnd := endTime.UnixMilli()
+		if tail := tailEnd - tailStart; tail > 0 {
+			gi.LastEventTs = tailStart
 			gi.TailGapMs = tail
 			if winning == "" {
-				if limit := s.marketSilenceMs(); limit > 0 && tail > limit {
+				if limit := s.marketSilenceMs(); limit > 0 && tail > limit && s.tailLostToFeed(tailStart, tailEnd, disconnectWindows) {
 					mc.Truncated = true
 				}
 			}
@@ -604,6 +666,25 @@ func (s *RecordingSession) bookStaleMs() int64 {
 	return s.collector.bookStaleAfter().Milliseconds()
 }
 
+// tailLostToFeed reports whether a missing recording tail is explained by an
+// actual feed outage rather than a market that simply stopped trading.
+//
+// A quiet wing strike on a healthy connection produces no events for minutes at
+// a time, so a large tail gap alone is not evidence of loss. Only two things
+// make it one: a market-WS disconnect window from this session's own connection
+// log, or a whole-feed silence interval the collector's watchdog recorded
+// (StartMarketWatchdog). Either overlapping the tail means the feed really was
+// down across it.
+func (s *RecordingSession) tailLostToFeed(tailStart, tailEnd int64, disconnectWindows [][2]int64) bool {
+	if overlapsDisconnect(tailStart, tailEnd, disconnectWindows) {
+		return true
+	}
+	if s.collector != nil && s.collector.silenceCovers(tailStart, tailEnd) {
+		return true
+	}
+	return false
+}
+
 // eventType returns the type discriminator string for a raw event.
 func eventType(ev interface{}) string {
 	switch ev.(type) {
@@ -643,7 +724,10 @@ func eventAssetID(ev interface{}) string {
 }
 
 // handleSyntheticResolve decides a market whose resolution message never
-// reached us, from the last order book seen at the settlement instant.
+// reached us. It first asks the venue for the official outcome (Gamma via the
+// connector) — that is authoritative and beats any read of our own book. Only
+// when the venue has not published a resolution does it fall back to the last
+// order book seen at the settlement instant.
 //
 // It never invents an outcome. With nothing recorded it leaves the session
 // unsettled (no_data); with market data but no book it leaves it unsettled
@@ -663,6 +747,43 @@ func (s *RecordingSession) handleSyntheticResolve() {
 	if s.meta.Truncated {
 		slog.Info("collector: skipping synthetic resolve for truncated session",
 			"market", s.cfg.MarketID)
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
+
+	// Official outcome first. The lookup is bounded (see officialResolution) so
+	// a hung HTTP call cannot stall the close-time timer or shutdown, and it is
+	// consulted even for a market we recorded nothing from — the venue's
+	// resolution stands on its own.
+	if res, ok := s.officialResolution(); ok {
+		winning := winningToken(s.cfg, "", string(res))
+		if winning != "" {
+			s.mu.Lock()
+			s.resolvedSynthetically = true
+			s.resolveBasis = ResolutionBasisGamma
+			s.mu.Unlock()
+
+			slog.Info("collector: resolved from the official outcome",
+				"market", s.cfg.MarketID, "resolution", string(res), "winner", winning)
+
+			if err := s.Resolve(winning); err != nil {
+				slog.Error("collector: official resolve failed", "market", s.cfg.MarketID, "err", err)
+				return
+			}
+			if err := s.Finalize(); err != nil {
+				slog.Error("collector: official finalize failed", "market", s.cfg.MarketID, "err", err)
+			}
+			return
+		}
+		slog.Warn("collector: official resolution carried no usable outcome, falling back to the book",
+			"market", s.cfg.MarketID, "resolution", string(res))
+	}
+
+	s.mu.Lock()
+	// Re-check: a real resolution event may have finalized the session while
+	// the official lookup was in flight.
+	if s.state != SessionRecording {
 		s.mu.Unlock()
 		return
 	}
@@ -779,60 +900,174 @@ func resolveFromMidprice(mid float64, cfg SessionConfig) (winningAssetID, basis 
 	}
 }
 
-// computeLastMidprice scans the buffered events for the last book snapshot
-// for the YES asset and returns its midprice = (best_bid + best_ask) / 2.
-// The YES asset's orderbook directly reflects the market's estimated
-// probability of the "Up" outcome. Using the NO asset's book would invert
-// the probability (NO_price ≈ 1 - YES_price) and give wrong resolution.
-//
-// Connector sends book levels in arbitrary order, so we sort before picking:
-// bids descending by price (best/highest first), asks ascending (best/lowest first).
-// Returns -1 if no YES asset book data is available.
+// computeLastMidprice returns the midprice of the live top-of-book at the
+// settlement instant, read from the per-asset BBO kept current by both
+// book_snapshot and price_change events. The YES asset's book directly reflects
+// the market's estimated probability of the "Up" outcome; the NO asset's book
+// is the mirror, so it is inverted (NO_price ≈ 1 - YES_price). Returns -1 when
+// no top-of-book was ever seen.
 func (s *RecordingSession) computeLastMidprice() float64 {
-	// Prefer the YES asset's book — it directly reflects the estimated
-	// probability of the "Up" outcome. Falls back to the NO asset's book,
-	// inverting (NO_price ≈ 1 - YES_price).
-	if len(s.lastYesBook) > 0 {
-		if mid, ok := midpriceFromBook(s.lastYesBook, s.cfg.YesAssetID); ok {
-			return mid
-		}
+	if mid, ok := s.yesBBO.mid(); ok {
+		return mid
 	}
-	if len(s.lastNoBook) > 0 {
-		if mid, ok := midpriceFromBook(s.lastNoBook, s.cfg.NoAssetID); ok {
-			return libs.R3(1 - mid)
-		}
+	if mid, ok := s.noBBO.mid(); ok {
+		return libs.R3(1 - mid)
 	}
 	return -1
 }
 
-// midpriceFromBook parses a stored book_snapshot Data and returns the token
-// midprice = (best_bid + best_ask) / 2. Connector sends book levels in
-// arbitrary order, so bids are sorted descending and asks ascending before
-// picking the best levels. Defaults bid=0 / ask=1 for one-sided or empty
-// books. Returns ok=false if the snapshot doesn't match wantAssetID.
-func midpriceFromBook(data []byte, wantAssetID string) (float64, bool) {
-	var snap connector.BookSnapshotEvent
-	if err := json.Unmarshal(data, &snap); err != nil {
+// topOfBook is the latest known best bid/ask for one outcome token. A full book
+// snapshot is authoritative and replaces both sides; a price_change reports the
+// exchange's own BBO for the levels it touched and only updates the sides it
+// carries (an empty/unparseable side is left as it was — the change is partial).
+type topOfBook struct {
+	bid    float64
+	ask    float64
+	hasBid bool
+	hasAsk bool
+}
+
+// setFromLevels replaces both sides from a full book snapshot. An empty side is
+// recorded as absent — the snapshot is authoritative — and mid() then falls back
+// to the collapsed-book default (bid 0 / ask 1) for it.
+func (b *topOfBook) setFromLevels(bids, asks []connector.Level) {
+	if p, ok := bestLevel(bids, false); ok {
+		b.bid, b.hasBid = p, true
+	} else {
+		b.bid, b.hasBid = 0, false
+	}
+	if p, ok := bestLevel(asks, true); ok {
+		b.ask, b.hasAsk = p, true
+	} else {
+		b.ask, b.hasAsk = 0, false
+	}
+}
+
+// updateFromChange applies an exchange-reported BBO update. An empty or
+// unparseable side is treated as unknown and keeps its previous value.
+func (b *topOfBook) updateFromChange(bestBid, bestAsk string) {
+	if p, ok := parsePrice(bestBid); ok {
+		b.bid, b.hasBid = p, true
+	}
+	if p, ok := parsePrice(bestAsk); ok {
+		b.ask, b.hasAsk = p, true
+	}
+}
+
+// mid returns the token midprice = (best_bid + best_ask) / 2, substituting the
+// collapsed-book default (bid 0 / ask 1) for a missing side so a one-sided book
+// is still readable — the same convention the previous snapshot reader used.
+// ok is false when neither side has ever been seen.
+func (b topOfBook) mid() (float64, bool) {
+	if !b.hasBid && !b.hasAsk {
 		return 0, false
 	}
-	if snap.AssetID != wantAssetID {
+	bid, ask := 0.0, 1.0
+	if b.hasBid {
+		bid = b.bid
+	}
+	if b.hasAsk {
+		ask = b.ask
+	}
+	return libs.R3((bid + ask) / 2), true
+}
+
+// bestLevel picks the best price from a set of levels: the highest bid, or the
+// lowest ask. Connector levels arrive in arbitrary order, so this scans rather
+// than trusting position. ok is false when no level carries a usable price.
+func bestLevel(levels []connector.Level, wantMin bool) (float64, bool) {
+	best := 0.0
+	found := false
+	for _, l := range levels {
+		p, ok := parsePrice(l.Price)
+		if !ok {
+			continue
+		}
+		if !found || (wantMin && p < best) || (!wantMin && p > best) {
+			best, found = p, true
+		}
+	}
+	return best, found
+}
+
+// parsePrice parses a decimal price string. An empty or malformed string is
+// reported as unknown rather than silently treated as zero.
+func parsePrice(s string) (float64, bool) {
+	if strings.TrimSpace(s) == "" {
 		return 0, false
 	}
-
-	sort.Slice(snap.Bids, func(i, j int) bool {
-		return libs.ParseFloat(snap.Bids[i].Price) > libs.ParseFloat(snap.Bids[j].Price)
-	})
-	sort.Slice(snap.Asks, func(i, j int) bool {
-		return libs.ParseFloat(snap.Asks[i].Price) < libs.ParseFloat(snap.Asks[j].Price)
-	})
-
-	bestBid := 0.0
-	bestAsk := 1.0
-	if len(snap.Bids) > 0 {
-		bestBid = libs.ParseFloat(snap.Bids[0].Price)
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, false
 	}
-	if len(snap.Asks) > 0 {
-		bestAsk = libs.ParseFloat(snap.Asks[0].Price)
+	return v, true
+}
+
+// ── Official (Gamma) resolution ─────────────────────────────
+
+const (
+	// officialLookupAttempts / officialLookupTimeout bound the post-settlement
+	// GetResolution call so a hung HTTP request cannot stall the synthetic
+	// resolve (which runs on the close-time timer and at shutdown).
+	officialLookupAttempts = 3
+	officialLookupTimeout  = 2 * time.Second
+)
+
+// officialResolution asks the venue for the market's published resolution via
+// the connector's GetResolution (Gamma-backed). Each attempt is bounded, and an
+// error or timeout is retried; a nil result means "not resolved yet" and is
+// returned immediately. ok is false whenever no usable resolution was obtained.
+func (s *RecordingSession) officialResolution() (connector.Resolution, bool) {
+	checker := s.resolutionChecker()
+	if checker == nil {
+		return "", false
 	}
-	return libs.R3((bestBid + bestAsk) / 2), true
+	for attempt := 0; attempt < officialLookupAttempts; attempt++ {
+		res, err, completed := resolutionWithTimeout(func() (*connector.Resolution, error) {
+			return checker.GetResolution(s.cfg.MarketID)
+		}, officialLookupTimeout)
+		if !completed {
+			continue // timed out — retry
+		}
+		if err != nil {
+			slog.Warn("collector: official resolution lookup failed",
+				"market", s.cfg.MarketID, "attempt", attempt+1, "err", err)
+			continue
+		}
+		if res == nil || *res == "" {
+			return "", false // not resolved (yet) — no point retrying
+		}
+		return *res, true
+	}
+	return "", false
+}
+
+// resolutionWithTimeout runs fn in a goroutine and waits up to d for it. It
+// returns completed=false on timeout; the goroutine and its buffered channel
+// are abandoned but cannot block (the send never blocks on a buffered channel).
+func resolutionWithTimeout(fn func() (*connector.Resolution, error), d time.Duration) (*connector.Resolution, error, bool) {
+	type result struct {
+		res *connector.Resolution
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		r, e := fn()
+		ch <- result{r, e}
+	}()
+	select {
+	case r := <-ch:
+		return r.res, r.err, true
+	case <-time.After(d):
+		return nil, nil, false
+	}
+}
+
+// resolutionChecker exposes the collector's ResolutionChecker (the connector),
+// or nil when it is absent — as in standalone tests.
+func (s *RecordingSession) resolutionChecker() ResolutionChecker {
+	if s.collector == nil {
+		return nil
+	}
+	return s.collector.resolutionChecker()
 }
