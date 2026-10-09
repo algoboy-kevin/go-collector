@@ -666,23 +666,50 @@ func (s *RecordingSession) bookStaleMs() int64 {
 	return s.collector.bookStaleAfter().Milliseconds()
 }
 
+// feedLostDuring reports whether [start, end] overlaps a window in which the
+// market feed was known to be down: a market-WS disconnect window from the
+// session's own connection log, or a whole-feed silence interval the
+// collector's watchdog recorded (StartMarketWatchdog). Either overlapping the
+// interval means the feed really was down across it — the only evidence that a
+// missing book, or a missing recording tail, is a real loss rather than a
+// market that simply stopped trading.
+func (s *RecordingSession) feedLostDuring(start, end int64, disconnectWindows [][2]int64) bool {
+	if overlapsDisconnect(start, end, disconnectWindows) {
+		return true
+	}
+	return s.collector != nil && s.collector.silenceCovers(start, end)
+}
+
 // tailLostToFeed reports whether a missing recording tail is explained by an
 // actual feed outage rather than a market that simply stopped trading.
 //
 // A quiet wing strike on a healthy connection produces no events for minutes at
-// a time, so a large tail gap alone is not evidence of loss. Only two things
-// make it one: a market-WS disconnect window from this session's own connection
-// log, or a whole-feed silence interval the collector's watchdog recorded
-// (StartMarketWatchdog). Either overlapping the tail means the feed really was
-// down across it.
+// a time, so a large tail gap alone is not evidence of loss; see feedLostDuring
+// for the two things that make it one.
 func (s *RecordingSession) tailLostToFeed(tailStart, tailEnd int64, disconnectWindows [][2]int64) bool {
-	if overlapsDisconnect(tailStart, tailEnd, disconnectWindows) {
-		return true
+	return s.feedLostDuring(tailStart, tailEnd, disconnectWindows)
+}
+
+// disconnectWindowsAtLocked builds this session's market-WS down intervals from
+// its own connection log, extending an open-ended disconnect — one that never
+// reconnected — forward to `end` so a feed still down across the interval is
+// caught. Caller holds s.mu. Mirrors closeEventStream's open-ended close, but
+// closes at the caller's instant (settlement here) rather than at finalize.
+func (s *RecordingSession) disconnectWindowsAtLocked(end int64) [][2]int64 {
+	events := append([]ConnectionEvent(nil), s.connEvents...)
+	if n := len(events); n > 0 && events[n-1].Status == "disconnected" && end > events[n-1].Timestamp {
+		events = append(events, ConnectionEvent{Status: "connected", Timestamp: end})
 	}
-	if s.collector != nil && s.collector.silenceCovers(tailStart, tailEnd) {
-		return true
-	}
-	return false
+	return buildDisconnectWindows(events)
+}
+
+// hasFeedLivenessEvidence reports whether this session can tell whether the
+// market feed was live during a book window: it needs a collector wired to a
+// market-WS status source (SetMarketStatus). Without one no disconnect window
+// or watchdog silence is ever recorded, so the hard age bound
+// (book_stale_timeout_s) is the only remaining guard.
+func (s *RecordingSession) hasFeedLivenessEvidence() bool {
+	return s.collector != nil && s.collector.hasMarketStatusSource()
 }
 
 // eventType returns the type discriminator string for a raw event.
@@ -731,10 +758,17 @@ func eventAssetID(ev interface{}) string {
 //
 // It never invents an outcome. With nothing recorded it leaves the session
 // unsettled (no_data); with market data but no book it leaves it unsettled
-// (no_book); and with a book that had already gone stale by settlement — a feed
-// that died hours earlier — it leaves it unsettled (stale_book). Only a book
-// still fresh at settlement may decide the outcome, and even then the
-// collapsed-book bounds are preferred over the 0.5-boundary guess.
+// (no_book); and with a book whose window was spanned by a real feed outage — a
+// market-WS disconnect or a whole-feed silence — it leaves it unsettled
+// (stale_book). Only a book the feed was live across may decide the outcome,
+// and even then the collapsed-book bounds are preferred over the 0.5-boundary
+// guess.
+//
+// Book age alone is NOT staleness: a deep-ITM/OTM ladder strike or a far
+// hit/dip rung pins its book at 0.001/0.999 and may receive no price_change for
+// many minutes on a perfectly healthy feed, yet the book still reflects the
+// outcome. So the interval [lastBookAt, settleAt] is judged against feed
+// liveness (disconnect/silence windows), not against a per-market age bound.
 func (s *RecordingSession) handleSyntheticResolve() {
 	s.mu.Lock()
 	// Only apply synthetic resolve if still recording (not already resolved).
@@ -790,22 +824,40 @@ func (s *RecordingSession) handleSyntheticResolve() {
 	count := s.count
 	lastBookAt := s.lastBookAt
 	settleAt := s.settleAtLocked()
+	// This session's own market-WS down intervals, with an open-ended disconnect
+	// run forward to settlement so a feed still down across the window is caught.
+	disconnectWindows := s.disconnectWindowsAtLocked(settleAt.UnixMilli())
 	s.mu.Unlock()
 
 	// Decide whether the book can be trusted at all, before reading it.
-	switch staleMs := s.bookStaleMs(); {
+	switch {
 	case count == 0:
 		s.declineResolution(ResolutionBasisNoData) // recorded nothing at all
 		return
 	case lastBookAt == 0:
 		s.declineResolution(ResolutionBasisNoBook) // market data, but never a book
 		return
-	case staleMs > 0 && settleAt.UnixMilli()-lastBookAt > staleMs:
+	}
+
+	settleMs := settleAt.UnixMilli()
+	if s.feedLostDuring(lastBookAt, settleMs, disconnectWindows) {
+		// A real outage (market-WS disconnect or whole-feed silence) covers the
+		// interval, so the book may predate the loss: refuse it.
 		s.declineResolution(ResolutionBasisStaleBook)
 		return
 	}
+	if !s.hasFeedLivenessEvidence() {
+		// No way to observe the feed at all (no collector / no status source):
+		// fall back to the hard age bound so a book frozen since a feed death is
+		// still refused. With a status source present this bound is never used —
+		// a quiet-but-healthy market resolves from its last book.
+		if staleMs := s.bookStaleMs(); staleMs > 0 && settleMs-lastBookAt > staleMs {
+			s.declineResolution(ResolutionBasisStaleBook)
+			return
+		}
+	}
 
-	// The book is fresh: mark synthetic and read the midprice.
+	// The feed was live across the book: mark synthetic and read the midprice.
 	s.mu.Lock()
 	s.resolvedSynthetically = true
 	s.lastMidprice = s.computeLastMidprice()

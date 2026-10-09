@@ -137,10 +137,12 @@ const (
 	// ResolutionBasisNoData means the session recorded nothing at all, so any
 	// outcome would be invented. The session is left unresolved.
 	ResolutionBasisNoData = "no_data"
-	// ResolutionBasisStaleBook means the last book snapshot was already too old
-	// at the settlement instant to reflect the market (e.g. the feed died hours
-	// before the market settled), so it was not used to decide the outcome. The
-	// session is left unresolved.
+	// ResolutionBasisStaleBook means the interval from the last book update to
+	// settlement was covered by a real feed outage (a market-WS disconnect or a
+	// whole-feed silence), so the book may have been frozen before the outage
+	// and no longer reflected the market. It is not decided from age alone: a
+	// quiet-but-healthy market resolves normally. The session is left
+	// unresolved.
 	ResolutionBasisStaleBook = "stale_book"
 )
 
@@ -492,10 +494,13 @@ type CollectorConfig struct {
 	// recomputed from. Default: noon_et.
 	EpochAnchor libs.EpochAnchor
 
-	// BookStaleAfter is how old the last book snapshot may be, at the
-	// settlement instant, for a synthetic resolve to trust it. Older than this
-	// and the outcome is left unresolved rather than decided from a frozen
-	// book. Zero selects DefaultBookStaleAfter; negative disables the check.
+	// BookStaleAfter is a HARD upper bound on how old the last book may be, at
+	// the settlement instant, for a synthetic resolve to trust it — used only
+	// when no feed-liveness evidence is available (nil collector / no status
+	// source). When a market-WS status source is wired, staleness is judged by
+	// disconnect/silence windows instead and this bound is not consulted, so a
+	// quiet-but-healthy market resolves from its last book. Zero selects
+	// DefaultBookStaleAfter; negative disables the fallback.
 	BookStaleAfter time.Duration
 
 	// MarketSilenceTimeout is how long a market recording may go without any
@@ -507,8 +512,10 @@ type CollectorConfig struct {
 
 // Defaults for the collector health knobs.
 const (
-	// DefaultBookStaleAfter is how stale a book may be at settlement and still
-	// be trusted for a synthetic resolve.
+	// DefaultBookStaleAfter is the fallback hard bound on how stale a book may
+	// be at settlement and still be trusted for a synthetic resolve. It applies
+	// only when no feed-liveness evidence exists (nil collector / no status
+	// source).
 	DefaultBookStaleAfter = 120 * time.Second
 	// DefaultMarketSilenceTimeout is how much of a recording window may be
 	// missing (end_time − last_event_ts) before the session is flagged
@@ -524,8 +531,11 @@ type HealthConfig struct {
 	// MarketSilenceTimeoutS is how much of a recording window may be missing
 	// (settlement − last event) before the session is flagged truncated.
 	MarketSilenceTimeoutS int `yaml:"market_silence_timeout_s"`
-	// BookStaleTimeoutS is how old the last book may be at settlement and still
-	// be trusted for a synthetic resolve.
+	// BookStaleTimeoutS is the fallback HARD upper bound on how old the last
+	// book may be at settlement and still be trusted for a synthetic resolve.
+	// It is consulted only when no feed-liveness evidence is available (nil
+	// collector / no market-WS status source); with a status source wired,
+	// staleness is judged by disconnect/silence windows instead.
 	BookStaleTimeoutS int `yaml:"book_stale_timeout_s"`
 }
 

@@ -37,9 +37,15 @@ connector:
 #   market_silence_timeout_s: a market recording whose last event predates its
 #       settlement by more than this is flagged truncated (tail_gap_ms), so a
 #       feed that died mid-window is never read as a complete recording.
-#   book_stale_timeout_s: how old the last book may be at settlement and still
-#       be trusted for a synthetic resolve; older and the outcome is left
-#       unresolved ("stale_book") rather than decided from a frozen book.
+#   book_stale_timeout_s: fallback HARD upper bound on how old the last book
+#       may be at settlement for a synthetic resolve to trust it. It is
+#       consulted ONLY when no feed-liveness evidence exists (no collector / no
+#       market-WS status source). With a status source wired — as the binary
+#       does — staleness is judged by whether the [last book, settlement]
+#       interval was covered by a real outage (a market-WS disconnect or a
+#       whole-feed silence), so a quiet-but-healthy ladder strike that gets no
+#       price_change for minutes still resolves from its book rather than being
+#       mislabeled "stale_book".
 #   Negative disables a check; 0 selects the default.
 collector:
   market_silence_timeout_s: 60

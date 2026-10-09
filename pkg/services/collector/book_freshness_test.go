@@ -85,9 +85,11 @@ func TestSyntheticResolveUsesFreshBooFromPriceChange(t *testing.T) {
 	}
 }
 
-// TestSyntheticResolveStaleWhenOnlyOldEvents proves the freshness check still
-// works: with only an hours-old snapshot and no price_change, the book is
-// genuinely stale and the outcome is left undecided.
+// TestSyntheticResolveStaleWhenOnlyOldEvents proves the fallback hard bound
+// still works: with NO feed-liveness evidence (the test collector has no
+// market-WS status source) an hours-old snapshot is refused. The age bound is
+// only the fallback — with a status source wired, staleness is judged by
+// disconnect/silence windows instead (see the liveness tests).
 func TestSyntheticResolveStaleWhenOnlyOldEvents(t *testing.T) {
 	root := t.TempDir()
 	sess := newTestSession(t, root, aboveContext())

@@ -130,9 +130,12 @@ func (c *EventCollector) marketSilenceTimeout() time.Duration {
 	}
 }
 
-// bookStaleAfter resolves the configured book-staleness bound for synthetic
-// resolve, applying the default when unset and disabling the check when
-// configured negative.
+// bookStaleAfter resolves the configured hard book-age bound for synthetic
+// resolve. It is a fallback used ONLY when no feed-liveness evidence is
+// available (collector == nil / no status source); when a status source is
+// wired, staleness is judged by disconnect/silence windows instead and this
+// bound is not consulted. Zero selects DefaultBookStaleAfter; negative disables
+// the fallback.
 func (c *EventCollector) bookStaleAfter() time.Duration {
 	switch {
 	case c.cfg.BookStaleAfter < 0:
@@ -207,6 +210,15 @@ func (c *EventCollector) marketStatus() (websocket.ConnectionStatus, bool) {
 		return "", false
 	}
 	return c.marketStatusFn(), true
+}
+
+// hasMarketStatusSource reports whether the collector is wired to a market-WS
+// status source (SetMarketStatus). Without one a session can neither seed its
+// connection state nor observe disconnect/reconnect callbacks, and the watchdog
+// has no status to read — so no feed-liveness evidence exists and the synthetic
+// resolve must fall back to the hard book-age bound.
+func (c *EventCollector) hasMarketStatusSource() bool {
+	return c != nil && c.marketStatusFn != nil
 }
 
 // resolutionChecker exposes the connector as a ResolutionChecker, or nil when
