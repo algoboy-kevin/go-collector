@@ -13,6 +13,7 @@ import (
 
 	"github.com/algoboy-kevin/go-collector/pkg/libs"
 	connector "github.com/algoboy-kevin/go-exchange-connector"
+	"github.com/algoboy-kevin/go-exchange-connector/pkg/websocket"
 )
 
 // EventCollector manages multiple parallel RecordingSessions and routes
@@ -62,6 +63,34 @@ type EventCollector struct {
 
 	connEvents   []ConnectionEvent
 	connEventsMu sync.Mutex
+
+	// lastMarketEventAt is the wall-clock (unix ms) of the most recent market
+	// event the dispatcher saw, for ANY asset and event type. The silence
+	// watchdog reads it to tell a quiet market from a dead feed.
+	lastMarketEventAt atomic.Int64
+
+	// marketStatusFn reports the market WS connection status; nil means unknown
+	// (standalone tests). Set with SetMarketStatus before sessions are created.
+	// Read while c.mu is already held (session construction) and set once at
+	// startup, so it is not guarded by c.mu.
+	marketStatusFn func() websocket.ConnectionStatus
+
+	// feedSilences is a bounded ring of whole-feed silence intervals recorded
+	// by the watchdog and consulted at finalize, to distinguish a real feed
+	// outage from a market that simply stopped trading.
+	feedSilenceMu sync.Mutex
+	feedSilences  []feedSilence
+
+	// Silence-watchdog state (see StartMarketWatchdog).
+	watchdogLastTrigger atomic.Int64 // unix ms of the last forced reconnect
+	watchdogConnected   atomic.Bool  // previous connection status
+}
+
+// feedSilence is one interval [start, end] (unix ms) during which the whole
+// market feed delivered no events.
+type feedSilence struct {
+	start int64
+	end   int64
 }
 
 // NewCollector creates a new EventCollector with the given connector. The
@@ -159,6 +188,185 @@ func (c *EventCollector) GetConnectionEvents() []ConnectionEvent {
 	out := make([]ConnectionEvent, len(c.connEvents))
 	copy(out, c.connEvents)
 	return out
+}
+
+// SetMarketStatus wires the collector to the market WS connection status. It
+// lets a new session seed its connection log with the state it was born into
+// (so a session created while the WS is already down counts that downtime) and
+// is the source of truth for the silence watchdog. Call it before sessions are
+// started.
+func (c *EventCollector) SetMarketStatus(fn func() websocket.ConnectionStatus) {
+	c.mu.Lock()
+	c.marketStatusFn = fn
+	c.mu.Unlock()
+}
+
+// marketStatus returns the current market WS status and whether it is known.
+func (c *EventCollector) marketStatus() (websocket.ConnectionStatus, bool) {
+	if c == nil || c.marketStatusFn == nil {
+		return "", false
+	}
+	return c.marketStatusFn(), true
+}
+
+// resolutionChecker exposes the connector as a ResolutionChecker, or nil when
+// it does not implement one — as in standalone tests.
+func (c *EventCollector) resolutionChecker() ResolutionChecker {
+	if c == nil || c.conn == nil {
+		return nil
+	}
+	checker, ok := c.conn.(ResolutionChecker)
+	if !ok {
+		return nil
+	}
+	return checker
+}
+
+// ── Market-feed silence watchdog ────────────────────────────
+
+// feedSilenceRingCap bounds the recorded silence intervals. Only the recent
+// tail matters — a tail-truncation decision is made at finalize, minutes after
+// the event — so an old interval is never needed.
+const feedSilenceRingCap = 64
+
+// MarketWatchdogDeps wires the silence watchdog to the runtime. Every field is
+// injectable so the watchdog can be driven by a fake clock and a stub connector
+// in tests and by the live connector in the collector binary.
+type MarketWatchdogDeps struct {
+	// Now returns the current time (the collector's runtime clock).
+	Now func() time.Time
+	// Status reports the market WS connection status.
+	Status func() websocket.ConnectionStatus
+	// Reconnect forces the market WS to drop and re-dial (wired to
+	// PolymarketConnector.ReconnectMarket).
+	Reconnect func()
+	// ActiveSessions reports how many sessions are recording; the watchdog
+	// only acts while at least one is.
+	ActiveSessions func() int
+}
+
+// StartMarketWatchdog runs a goroutine that force-reconnects the market WS when
+// the whole market feed has been silent longer than the configured
+// market-silence timeout while sessions are active. It complements the
+// connector's transport-level ping/pong watchdog, which cannot see a socket
+// that still answers pings but has stopped delivering events. A disconnect is
+// not a silence — the connector's own reconnect loop owns that — so the
+// watchdog only acts while the status reads connected.
+//
+// interval <= 0 selects a 10s tick. A market-silence timeout <= 0 disables the
+// watchdog entirely. The goroutine stops when ctx is cancelled.
+func (c *EventCollector) StartMarketWatchdog(ctx context.Context, interval time.Duration, deps MarketWatchdogDeps) {
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
+	timeout := c.marketSilenceTimeout()
+	if timeout <= 0 {
+		return
+	}
+	if deps.Now == nil {
+		deps.Now = time.Now
+	}
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				c.marketWatchdogTick(deps.Now(), deps, timeout)
+			}
+		}
+	}()
+}
+
+// marketWatchdogTick is one watchdog evaluation. It is separated from the tick
+// loop so tests can drive it with a controlled clock and status.
+//
+// A trigger is recorded and deps.Reconnect is called when: sessions are active,
+// the feed is connected, and no market event has arrived for longer than the
+// timeout. Further triggers are suppressed until either an event arrives (the
+// silence ended) or another full timeout elapses, so a feed that stays silent
+// is not reconnected on every tick. A transition to connected resets the clock,
+// so a fresh connection gets a full silence window before it is judged.
+func (c *EventCollector) marketWatchdogTick(now time.Time, deps MarketWatchdogDeps, timeout time.Duration) {
+	if timeout <= 0 || deps.Status == nil {
+		return
+	}
+	nowMs := now.UnixMilli()
+
+	connected := deps.Status() == websocket.StatusConnected
+	prev := c.watchdogConnected.Swap(connected)
+	if connected && !prev {
+		c.lastMarketEventAt.Store(nowMs)
+		c.watchdogLastTrigger.Store(0)
+	}
+	if !connected {
+		return
+	}
+	if deps.ActiveSessions != nil && deps.ActiveSessions() <= 0 {
+		return
+	}
+
+	last := c.lastMarketEventAt.Load()
+	if last == 0 {
+		// No event has been seen since process start; the connect transition
+		// above seeds this, so 0 means we have never been connected.
+		return
+	}
+
+	timeoutMs := timeout.Milliseconds()
+	silentFor := nowMs - last
+	if silentFor <= timeoutMs {
+		return
+	}
+
+	if lastTrigger := c.watchdogLastTrigger.Load(); lastTrigger != 0 {
+		eventSinceTrigger := last > lastTrigger
+		if !eventSinceTrigger && nowMs-lastTrigger < timeoutMs {
+			return // suppressed: no data yet and not a full window since
+		}
+	}
+
+	c.watchdogLastTrigger.Store(nowMs)
+	c.recordFeedSilence(last, nowMs)
+	slog.Warn("collector: market feed silent, forcing reconnect",
+		"silent_ms", silentFor,
+		"timeout_ms", timeoutMs,
+	)
+	if deps.Reconnect != nil {
+		deps.Reconnect()
+	}
+}
+
+// recordFeedSilence notes an interval [start, end] (unix ms) during which the
+// whole market feed was silent, for the tail-truncation decision at finalize.
+func (c *EventCollector) recordFeedSilence(start, end int64) {
+	if end < start {
+		start, end = end, start
+	}
+	c.feedSilenceMu.Lock()
+	c.feedSilences = append(c.feedSilences, feedSilence{start: start, end: end})
+	if n := len(c.feedSilences); n > feedSilenceRingCap {
+		c.feedSilences = append([]feedSilence(nil), c.feedSilences[n-feedSilenceRingCap:]...)
+	}
+	c.feedSilenceMu.Unlock()
+}
+
+// silenceCovers reports whether [start, end] overlaps any recorded whole-feed
+// silence interval.
+func (c *EventCollector) silenceCovers(start, end int64) bool {
+	if c == nil {
+		return false
+	}
+	c.feedSilenceMu.Lock()
+	defer c.feedSilenceMu.Unlock()
+	for _, iv := range c.feedSilences {
+		if start < iv.end && end > iv.start {
+			return true
+		}
+	}
+	return false
 }
 
 // StartSession creates a new recording session for a market.  It fetches
@@ -299,6 +507,11 @@ func (c *EventCollector) HandleEvent(ev any) {
 		c.routeFeed(FeedSourceBinance, e.Market, e.Symbol, ev)
 		return
 	}
+
+	// Past the feed events, everything is a market event: it proves the market
+	// WS is still delivering, for ANY asset we are subscribed to. The silence
+	// watchdog compares this against the configured timeout.
+	c.lastMarketEventAt.Store(time.Now().UnixMilli())
 
 	typ := eventType(ev)
 	assetID := eventAssetID(ev)
