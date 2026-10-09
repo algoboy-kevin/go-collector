@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	ws "github.com/algoboy-kevin/go-exchange-connector/pkg/websocket"
 )
 
 // Per-session connection stats and the tail-gap completeness flag. Both exist
@@ -99,11 +101,12 @@ func TestSessionsAccumulateTheirOwnConnectionStats(t *testing.T) {
 	}
 }
 
-// TestTailGapFlagsTruncatedWhenTheFeedDies proves a recording whose last event
-// predates settlement by more than the silence timeout is flagged truncated and
-// carries the gap, so a stalled feed is visible in the metadata rather than
-// reading as a complete recording.
-func TestTailGapFlagsTruncatedWhenTheFeedDies(t *testing.T) {
+// TestQuietTailOnHealthyFeedIsNotTruncated proves a large tail gap is not by
+// itself proof of data loss: a quiet wing strike on a healthy feed legitimately
+// goes minutes without an event, so a recording whose last event predates
+// settlement — with no disconnect and no whole-feed silence recorded — must NOT
+// be flagged truncated. The gap is still reported in data_quality.
+func TestQuietTailOnHealthyFeedIsNotTruncated(t *testing.T) {
 	root := t.TempDir()
 	sess := newTestSession(t, root, aboveContext())
 	recordOne(t, sess) // last event at sessNow, hours before the settle instant
@@ -113,8 +116,8 @@ func TestTailGapFlagsTruncatedWhenTheFeedDies(t *testing.T) {
 	}
 
 	md := readMarketMeta(t, filepath.Join(root, "2026-10-02", "5169514", "metadata.json"))
-	if !md.Truncated {
-		t.Error("a recording whose last event predates settlement by hours must be flagged truncated")
+	if md.Truncated {
+		t.Error("a quiet tail on a healthy feed must not be flagged truncated")
 	}
 	if md.Resolution != ResolutionUnsettled {
 		t.Errorf("resolution = %q, want %q", md.Resolution, ResolutionUnsettled)
@@ -127,6 +130,52 @@ func TestTailGapFlagsTruncatedWhenTheFeedDies(t *testing.T) {
 	}
 	if want := settleAt.Sub(sessNow).Milliseconds(); md.DataQuality.TailGapMs != want {
 		t.Errorf("tail_gap_ms = %d, want %d", md.DataQuality.TailGapMs, want)
+	}
+}
+
+// TestFeedSilenceCoveringTheTailIsTruncated proves the complement: when the
+// silence watchdog recorded that the WHOLE feed was silent across the tail, the
+// gap is a real loss and the session is flagged truncated.
+func TestFeedSilenceCoveringTheTailIsTruncated(t *testing.T) {
+	root := t.TempDir()
+	sess := newTestSession(t, root, aboveContext())
+	recordOne(t, sess)
+
+	// The feed delivered nothing from the session's last event through
+	// well past the settlement instant.
+	sess.collector.recordFeedSilence(sessNow.UnixMilli(), settleAt.Add(time.Hour).UnixMilli())
+
+	if err := sess.Finalize(); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+
+	md := readMarketMeta(t, filepath.Join(root, "2026-10-02", "5169514", "metadata.json"))
+	if !md.Truncated {
+		t.Error("a tail covered by a whole-feed silence must be flagged truncated")
+	}
+	if md.Resolution != ResolutionUnsettled {
+		t.Errorf("resolution = %q, want %q", md.Resolution, ResolutionUnsettled)
+	}
+}
+
+// TestWSDisconnectCoveringTheTailIsTruncated proves a market-WS disconnect that
+// spans the tail counts as a real loss even without a recorded silence: the
+// session's own connection log is enough evidence.
+func TestWSDisconnectCoveringTheTailIsTruncated(t *testing.T) {
+	root := t.TempDir()
+	sess := newTestSession(t, root, aboveContext())
+	recordOne(t, sess)
+	// Open-ended disconnect: the WS went down at the last event and never
+	// reconnected. buildDisconnectWindows closes it at the finalize instant.
+	sess.RecordConnection("disconnected", sessNow)
+
+	if err := sess.Finalize(); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+
+	md := readMarketMeta(t, filepath.Join(root, "2026-10-02", "5169514", "metadata.json"))
+	if !md.Truncated {
+		t.Error("a tail spanned by a market-WS disconnect must be flagged truncated")
 	}
 }
 
@@ -150,5 +199,48 @@ func TestResolvedSessionIsNeverTruncatedByItsTailGap(t *testing.T) {
 	}
 	if md.Resolution != ResolutionYes {
 		t.Errorf("resolution = %q, want %q", md.Resolution, ResolutionYes)
+	}
+}
+
+// TestSessionSeedsInitialDisconnectedState proves a session created while the
+// market WS is already down opens a disconnect window at its start, so a later
+// reconnect closes it and the downtime is counted — instead of the session
+// reporting zero disconnects because the callback fired before it existed.
+func TestSessionSeedsInitialDisconnectedState(t *testing.T) {
+	ec, conn := newTestCollector(t)
+	ec.SetMarketStatus(func() ws.ConnectionStatus { return ws.StatusDisconnected })
+
+	sess, err := ec.StartSession(conn, SessionConfig{
+		MarketID:        "m-seed",
+		YesAssetID:      "m-seed-yes",
+		NoAssetID:       "m-seed-no",
+		MarketStartTime: time.Now(),
+		MarketEndTime:   time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+
+	if len(sess.connEvents) != 1 || sess.connEvents[0].Status != "disconnected" {
+		t.Fatalf("seeded connEvents = %+v, want a single initial 'disconnected'", sess.connEvents)
+	}
+	start := sess.connEvents[0].Timestamp
+
+	// The WS comes back 5s later: the window closes with a real duration.
+	recordOne(t, sess)
+	sess.RecordConnection("connected", time.UnixMilli(start).Add(5*time.Second))
+
+	if err := sess.Finalize(); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	md := readMarketMeta(t, filepath.Join(ec.recordingDir(), "m-seed", "metadata.json"))
+	if md.Connections == nil {
+		t.Fatal("metadata has no connections block")
+	}
+	if md.Connections.DisconnectCount != 1 {
+		t.Errorf("disconnect_count = %d, want 1 (the initial down window)", md.Connections.DisconnectCount)
+	}
+	if md.Connections.TotalDisconnectedMs != 5000 {
+		t.Errorf("total_disconnected_ms = %d, want 5000", md.Connections.TotalDisconnectedMs)
 	}
 }
