@@ -4,10 +4,15 @@ go 1.24.0
 
 require (
 	github.com/algoboy-kevin/go-des v0.1.5
-	github.com/algoboy-kevin/go-exchange-connector v0.7.2
+	github.com/algoboy-kevin/go-exchange-connector v0.7.3
 	github.com/coder/websocket v1.8.12
 	gopkg.in/yaml.v3 v3.0.1
 )
+
+// TEMP: drop after pushing tag v0.7.3 — the local ReconnectMarket primitive
+// (v0.7.3) is not on the module proxy yet, so resolve the connector from the
+// sibling checkout.
+replace github.com/algoboy-kevin/go-exchange-connector => ../go-exchange-connector
 
 require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
