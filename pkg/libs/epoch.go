@@ -55,6 +55,11 @@ const (
 	// AnchorMidnightET cuts the day at 00:00 ET: used by hit-price, whose events
 	// observe an entire ET calendar day and settle at its end.
 	AnchorMidnightET EpochAnchor = "midnight_et"
+
+	// AnchorWeeklyET cuts the week at Monday 00:00 ET: used by the weekly
+	// hit-price series, whose events observe an entire ET week (Monday 00:00 ET
+	// through Sunday 23:59 ET) and settle at its end.
+	AnchorWeeklyET EpochAnchor = "weekly_et"
 )
 
 // epochHour returns the ET wall-clock hour of the anchor, and whether the
@@ -80,6 +85,9 @@ func (a EpochAnchor) Valid() bool {
 // AnchorETBoundary, which follows the series interval).
 func (a EpochAnchor) Daily() bool { return a.Valid() }
 
+// Weekly reports whether the anchor cuts whole ET weeks (Monday 00:00 ET).
+func (a EpochAnchor) Weekly() bool { return a == AnchorWeeklyET }
+
 // ParseEpochAnchor parses a config string, defaulting to AnchorNoonET for "".
 func ParseEpochAnchor(s string) (EpochAnchor, error) {
 	switch s {
@@ -91,10 +99,28 @@ func ParseEpochAnchor(s string) (EpochAnchor, error) {
 		return AnchorMidnightET, nil
 	case string(AnchorETBoundary):
 		return AnchorETBoundary, nil
+	case string(AnchorWeeklyET):
+		return AnchorWeeklyET, nil
 	default:
-		return "", fmt.Errorf("libs: unknown epoch anchor %q (want %q, %q or %q)",
-			s, AnchorNoonET, AnchorMidnightET, AnchorETBoundary)
+		return "", fmt.Errorf("libs: unknown epoch anchor %q (want %q, %q, %q or %q)",
+			s, AnchorNoonET, AnchorMidnightET, AnchorETBoundary, AnchorWeeklyET)
 	}
+}
+
+// WeekWindow returns the ET week [Monday 00:00 ET, next Monday 00:00 ET)
+// containing t.
+//
+// The boundary is computed on the ET calendar (Monday is fixed in ET wall
+// clock) and advanced with AddDate, so the wall-clock hour is preserved across
+// a DST transition — only the UTC offset changes. Nothing here truncates a UTC
+// time, which would put the boundary at 20:00 ET for the previous day.
+func WeekWindow(t time.Time) (start, end time.Time) {
+	tl := t.In(EpochLocation)
+	midnight := time.Date(tl.Year(), tl.Month(), tl.Day(), 0, 0, 0, 0, EpochLocation)
+	// time.Weekday is Sunday=0..Saturday=6; days elapsed since the week's Monday.
+	daysSinceMonday := (int(midnight.Weekday()) + 6) % 7
+	start = midnight.AddDate(0, 0, -daysSinceMonday)
+	return start, start.AddDate(0, 0, 7)
 }
 
 // anchorAt returns the anchor instant on the ET calendar date of day.

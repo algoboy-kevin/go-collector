@@ -41,6 +41,11 @@ const (
 	FamilyHit MarketFamily = "hit"
 )
 
+// WeekDuration is the interval of a weekly market family (7 × 24h). It is its
+// own interval so a weekly hit series has a distinct SeriesKey — and a distinct
+// config name — from the daily one.
+const WeekDuration = 7 * 24 * time.Hour
+
 // IsLadder reports whether the family puts several markets inside one event
 // (a strike or range ladder), which means the event must fan out to N
 // recording sessions rather than one.
@@ -117,12 +122,23 @@ type SeriesSpec struct {
 }
 
 // Name returns the config shorthand for a key (e.g. "btc_1h", "btc_above").
+//
+// The hit family exists at two intervals (daily and weekly), so its weekly
+// form carries the interval in the name ("btc_hit_1w"); every other family has
+// a single interval and keeps the bare "<asset>_<family>" form.
 func (k SeriesKey) Name() string {
 	asset := strings.ToLower(k.Asset)
-	if k.Family != FamilyUpDown {
+	switch k.Family {
+	case FamilyUpDown:
+		return fmt.Sprintf("%s_%s", asset, IntervalLabel(k.Interval))
+	case FamilyHit:
+		if k.Interval != 0 && k.Interval != 24*time.Hour {
+			return fmt.Sprintf("%s_%s_%s", asset, k.Family, IntervalLabel(k.Interval))
+		}
+		return fmt.Sprintf("%s_%s", asset, k.Family)
+	default:
 		return fmt.Sprintf("%s_%s", asset, k.Family)
 	}
-	return fmt.Sprintf("%s_%s", asset, IntervalLabel(k.Interval))
 }
 
 // IntervalLabel renders a duration as the short label used in config and paths.
@@ -138,12 +154,14 @@ func IntervalLabel(d time.Duration) string {
 		return "4h"
 	case 24 * time.Hour:
 		return "1d"
+	case WeekDuration:
+		return "1w"
 	default:
 		return strings.TrimSuffix(d.String(), "0s")
 	}
 }
 
-// ParseInterval parses an interval label ("5m", "15m", "1h", "4h", "1d").
+// ParseInterval parses an interval label ("5m", "15m", "1h", "4h", "1d", "1w").
 func ParseInterval(s string) (time.Duration, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "5m", "5min":
@@ -156,15 +174,18 @@ func ParseInterval(s string) (time.Duration, error) {
 		return 4 * time.Hour, nil
 	case "1d", "24h", "daily":
 		return 24 * time.Hour, nil
+	case "1w", "7d", "weekly":
+		return WeekDuration, nil
 	default:
-		return 0, fmt.Errorf("libs: unknown interval %q (want 5m, 15m, 1h, 4h or 1d)", s)
+		return 0, fmt.Errorf("libs: unknown interval %q (want 5m, 15m, 1h, 4h, 1d or 1w)", s)
 	}
 }
 
 // ParseSeriesName parses a config shorthand into a SeriesKey.
 //
-//	"btc_1h"    → {BTC, updown, 1h}
-//	"btc_above" → {BTC, above,  24h}
+//	"btc_1h"     → {BTC, updown, 1h}
+//	"btc_above"  → {BTC, above,  24h}
+//	"btc_hit_1w" → {BTC, hit,    1w}
 func ParseSeriesName(name string) (SeriesKey, error) {
 	parts := strings.SplitN(strings.ToLower(strings.TrimSpace(name)), "_", 2)
 	if len(parts) != 2 {
@@ -176,6 +197,17 @@ func ParseSeriesName(name string) (SeriesKey, error) {
 	switch MarketFamily(tail) {
 	case FamilyAbove, FamilyRange, FamilyHit:
 		return SeriesKey{Asset: asset, Family: MarketFamily(tail), Interval: 24 * time.Hour}, nil
+	}
+
+	// A family that exists at more than one interval carries it in the name
+	// ("hit_1w"): resolve the family from the head and the interval from the
+	// tail. This is what lets the daily and weekly hit series coexist.
+	if i := strings.IndexByte(tail, '_'); i > 0 {
+		if fam := MarketFamily(tail[:i]); fam.IsLadder() {
+			if iv, err := ParseInterval(tail[i+1:]); err == nil {
+				return SeriesKey{Asset: asset, Family: fam, Interval: iv}, nil
+			}
+		}
 	}
 
 	interval, err := ParseInterval(tail)
@@ -242,7 +274,13 @@ var seriesRegistry = map[SeriesKey]SeriesSpec{
 		Name: "btc_hit", GammaSeries: "bitcoin-hit-price-daily",
 		Anchor: AnchorMidnightET, Source: SettleBinance1mHigh,
 		MarketsPerEventHint: 16, Ladder: true, Verified: true,
-		Note: `"immediately resolve to Yes if any Binance 1-minute candle for Bitcoin (BTC/USDT) on the date specified in the title, between 12:00 AM ET and 11:59 PM ET has a final High price equal to or greater than the price specified"; event slug what-price-will-bitcoin-hit-on-<month>-<d>-<year>; NOTE: settles at midnight ET, so its epoch id is the day AFTER the title date`,
+		Note: `"immediately resolve to Yes if any Binance 1-minute candle for Bitcoin (BTC/USDT) on the date specified in the title, between 12:00 AM ET and 11:59 PM ET has a final High price equal to or greater than the price specified"; event slug what-price-will-bitcoin-hit-on-<month>-<d>-<year>; verified live 2026-10-09 (series id 10200, recurrence daily, event end 2026-10-10T04:00:00Z = midnight ET); NOTE: settles at midnight ET, so its epoch id is the day AFTER the title date`,
+	},
+	{Asset: "BTC", Family: FamilyHit, Interval: WeekDuration}: {
+		Name: "btc_hit_1w", GammaSeries: "bitcoin-hit-price-weekly",
+		Anchor: AnchorWeeklyET, Source: SettleBinance1mHigh,
+		MarketsPerEventHint: 16, Ladder: true, Verified: true,
+		Note: `"resolve to Yes if any Binance 1-minute candle ... on the date specified in the title ... has a final High price equal to or greater than the price specified" (reach, "↑ <n>") / "equal to or less than" (dip, "↓ <n>"); verified live 2026-10-09 against series 'bitcoin-hit-price-weekly' (id 10151, recurrence weekly), event slug what-price-will-bitcoin-hit-<month>-<d>-<d+6>-<year>; window is Monday 00:00 ET → Sunday 23:59 ET, settling on the next Monday 00:00 ET (endDate verified 2026-10-12T04:00:00Z); a hit rung can resolve EARLY once touched, so the synthetic resolve must never fire before the anchored close`,
 	},
 }
 
@@ -275,6 +313,10 @@ func (s SeriesSpec) TargetSettle(now time.Time) (time.Time, error) {
 			return time.Time{}, fmt.Errorf("libs: series %s has no interval", s.Name)
 		}
 		_, end := IntervalWindow(now, s.Key.Interval)
+		return end, nil
+	}
+	if s.Anchor == AnchorWeeklyET {
+		_, end := WeekWindow(now)
 		return end, nil
 	}
 	id, err := EpochID(now, s.Anchor)

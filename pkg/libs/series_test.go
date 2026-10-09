@@ -22,8 +22,8 @@ func TestRegistryIntegrity(t *testing.T) {
 		if s.Key.Family.IsLadder() != s.Ladder {
 			t.Errorf("%s: IsLadder()=%v but Ladder=%v", s.Name, s.Key.Family.IsLadder(), s.Ladder)
 		}
-		if s.Ladder && !s.Anchor.Daily() {
-			t.Errorf("%s: a ladder must settle on a daily anchor", s.Name)
+		if s.Ladder && !s.Anchor.Daily() && !s.Anchor.Weekly() {
+			t.Errorf("%s: a ladder must settle on a daily or weekly anchor", s.Name)
 		}
 		if s.Key.Family == FamilyUpDown && s.Key.Interval < 24*time.Hour && s.Anchor != AnchorETBoundary {
 			t.Errorf("%s: intraday up/down must use the ET-boundary anchor", s.Name)
@@ -83,6 +83,14 @@ func TestTargetSettle(t *testing.T) {
 		{"btc_1d", "2026-10-02 12:30", "2026-10-03 12:00"},
 		{"btc_above", "2026-10-02 11:00", "2026-10-02 12:00"},
 		{"btc_range", "2026-10-02 18:00", "2026-10-03 12:00"},
+
+		// Hit price, daily: the end of the ET calendar day containing now.
+		{"btc_hit", "2026-10-09 11:00", "2026-10-10 00:00"},
+
+		// Hit price, weekly: the next Monday 00:00 ET (the week runs Mon→Sun).
+		{"btc_hit_1w", "2026-10-07 13:20", "2026-10-12 00:00"}, // Wed
+		{"btc_hit_1w", "2026-10-11 23:00", "2026-10-12 00:00"}, // Sun, last hours
+		{"btc_hit_1w", "2026-10-12 00:30", "2026-10-19 00:00"}, // just into the next week
 	}
 	for _, tc := range tests {
 		got, err := mustSpec(t, tc.series).TargetSettle(at(t, tc.nowET))
@@ -121,6 +129,36 @@ func TestTargetSettleAcrossDST(t *testing.T) {
 	}
 }
 
+// TestTargetSettleWeeklyAcrossDST proves the weekly boundary is computed on the
+// ET calendar and advanced with AddDate: the week Mon 26 Oct → Mon 2 Nov 2026
+// straddles the 1 Nov DST transition, so its end is 05:00Z (EST) rather than the
+// 04:00Z a naive `+7×24h` from an EDT instant would produce.
+func TestTargetSettleWeeklyAcrossDST(t *testing.T) {
+	spec := mustSpec(t, "btc_hit_1w")
+
+	// The week containing 28 Oct (EDT) ends Monday 2 Nov, after the clocks fell
+	// back, so midnight ET is 05:00Z.
+	got, err := spec.TargetSettle(at(t, "2026-10-28 09:00"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := at(t, "2026-11-02 00:00"); !got.Equal(want) {
+		t.Fatalf("weekly target = %s, want %s", got.In(EpochLocation), want.In(EpochLocation))
+	}
+	if h := got.UTC().Hour(); h != 5 {
+		t.Errorf("weekly target offset = %02d:00Z, want 05:00Z (EST after the DST change)", h)
+	}
+
+	// A week entirely inside EDT keeps the 04:00Z offset.
+	got, err = spec.TargetSettle(at(t, "2026-10-07 09:00"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h := got.UTC().Hour(); h != 4 {
+		t.Errorf("weekly target offset = %02d:00Z, want 04:00Z (EDT)", h)
+	}
+}
+
 // TestEpochIDFor pins the date a market's title names.
 func TestEpochIDFor(t *testing.T) {
 	tests := []struct {
@@ -137,6 +175,9 @@ func TestEpochIDFor(t *testing.T) {
 		{"btc_above", "2026-10-02 12:00", "2026-10-02"},
 		{"btc_range", "2026-10-02 12:00", "2026-10-02"},
 		{"btc_hit", "2026-10-03 00:00", "2026-10-02"},
+		// The weekly hit settles on the Monday that closes the titled week, so
+		// the title date is the Sunday the week ends.
+		{"btc_hit_1w", "2026-10-12 00:00", "2026-10-11"},
 	}
 	for _, tc := range tests {
 		if got := mustSpec(t, tc.series).EpochIDFor(at(t, tc.settleET)); got != tc.want {
