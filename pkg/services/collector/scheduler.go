@@ -444,6 +444,17 @@ func (s *EpochScheduler) resolveTargets(ctx context.Context, sel SeriesSelection
 		return nil, nil // already settled, or settling: nothing left to record
 	}
 
+	if offset > 0 {
+		// A ladder's "+n" carry only means something when it reaches a
+		// different settlement instant. For a weekly ladder, now and now+n
+		// usually fall in the same week, so the carry would re-target the very
+		// instant already recorded — skip it rather than re-run discovery for
+		// it on every poll.
+		if base, err := sel.Spec.TargetSettle(now); err == nil && settleAt.Equal(base) {
+			return nil, nil
+		}
+	}
+
 	// Steady state is one claim per (series, offset, settle instant): an hour for
 	// the hourly family, a day for the rest. This memo is checked BEFORE any HTTP
 	// because that is what makes the 30s poll free — without it every tick would

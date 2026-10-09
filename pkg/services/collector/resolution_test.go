@@ -239,6 +239,7 @@ func TestSettlementWindowStart(t *testing.T) {
 		{"btc_1d", 24 * time.Hour}, // the previous noon — the candle it compares
 		{"btc_above", 24 * time.Hour},
 		{"btc_hit", 24 * time.Hour}, // midnight ET: the whole observed ET day
+		{"btc_hit_1w", 7 * 24 * time.Hour},
 	}
 	for _, tc := range tests {
 		spec := mustSpecByName(t, tc.series)

@@ -822,6 +822,67 @@ func TestSchedulerRejectsUnknownSeries(t *testing.T) {
 	}
 }
 
+// TestSchedulerWeeklyLadderCarriesOneTargetPerWeek pins the weekly hit ladder's
+// offset handling: mid-week, the "+1 day" carry falls in the same ET week and is
+// skipped (one target), while on the last day of the week it crosses into the
+// next week and yields a second, distinct target — all computed on the ET
+// calendar, so a DST transition cannot shift the boundary.
+func TestSchedulerWeeklyLadderCarriesOneTargetPerWeek(t *testing.T) {
+	ec, _ := newTestCollector(t)
+	hit := mustSpecByName(t, "btc_hit_1w")
+	disc := &stubDiscovery{series: map[string][]connector.GammaEvent{}}
+
+	sched, err := NewEpochScheduler(ec, disc, SchedulerConfig{
+		Recording:    RecordingConfig{Days: 1, Epoch: string(libs.AnchorNoonET), LadderOffsetDays: 1},
+		Series:       []SeriesConfig{{Series: "btc_hit_1w"}},
+		PollInterval: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wednesday 13:00 ET: the week runs Mon→Sun, so now and now+1d share the
+	// target and the offset contributes nothing.
+	wed := time.Date(2026, 10, 7, 17, 0, 0, 0, time.UTC)
+	target, err := hit.TargetSettle(wed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disc.series[hit.GammaSeries] = []connector.GammaEvent{
+		ladderEvent("hit-week", target, "hit"),
+	}
+
+	planned, err := sched.Plan(context.Background(), wed)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if len(planned) != 1 {
+		t.Fatalf("planned %d targets mid-week, want 1 (the +1 day offset stays in the same week)", len(planned))
+	}
+	if !planned[0].SettleAt.Equal(target) {
+		t.Errorf("target settle = %s, want %s", planned[0].SettleAt, target)
+	}
+
+	// Sunday 13:00 ET: now+1d is next Monday, a different week, so both this
+	// week's event and the next week's are targets.
+	sun := time.Date(2026, 10, 11, 17, 0, 0, 0, time.UTC)
+	nextTarget, err := hit.TargetSettle(sun.AddDate(0, 0, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	disc.series[hit.GammaSeries] = []connector.GammaEvent{
+		ladderEvent("hit-week", target, "hit"),
+		ladderEvent("hit-next", nextTarget, "hitn"),
+	}
+	planned, err = sched.Plan(context.Background(), sun)
+	if err != nil {
+		t.Fatalf("Plan(sunday): %v", err)
+	}
+	if len(planned) != 2 {
+		t.Fatalf("planned %d targets on the last day of the week, want 2 (this week and next)", len(planned))
+	}
+}
+
 // ── Helpers ─────────────────────────────────────────────────
 
 // snapshotSessions returns the collector's live sessions.

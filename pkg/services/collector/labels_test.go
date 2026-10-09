@@ -78,7 +78,11 @@ func TestComparisonFor(t *testing.T) {
 		{SettleSourceChainlinkTWAP, StrikeRange{}, CompareTWAPVsStart},  // up/down 4h
 		{SettleSourceBinanceCandle, StrikeRange{}, CompareUpVsOpen},     // up/down 1h
 		{SettleSourceBinance1mHigh, StrikeRange{}, CompareAnyHighAbove}, // hit price
-		{SettleSourceBinance1mClose, StrikeRange{}, CompareUpVsOpen},    // up/down daily
+		// A hit ladder carries both directions: "↑ <n>" is a reach rung
+		// (RangeLow) and "↓ <n>" a dip rung (RangeHigh).
+		{SettleSourceBinance1mHigh, StrikeRange{RangeLow: ptrF(93000)}, CompareAnyHighAbove},
+		{SettleSourceBinance1mHigh, StrikeRange{RangeHigh: ptrF(70000)}, CompareAnyLowBelow},
+		{SettleSourceBinance1mClose, StrikeRange{}, CompareUpVsOpen}, // up/down daily
 		{SettleSourceBinance1mClose, StrikeRange{Strike: ptrF(80000)}, CompareAboveStrike},
 		{SettleSourceBinance1mClose, StrikeRange{RangeHigh: ptrF(74000)}, CompareBelowLevel},
 		{SettleSourceBinance1mClose, StrikeRange{RangeLow: ptrF(94000)}, CompareAboveLevel},
@@ -93,11 +97,12 @@ func TestComparisonFor(t *testing.T) {
 
 func TestComparisonForSeriesUsesRegistrySource(t *testing.T) {
 	cases := map[string]string{
-		"btc_1h":    CompareUpVsOpen,
-		"btc_4h":    CompareTWAPVsStart,
-		"btc_1d":    CompareUpVsOpen,
-		"btc_above": CompareAboveStrike,
-		"btc_hit":   CompareAnyHighAbove,
+		"btc_1h":     CompareUpVsOpen,
+		"btc_4h":     CompareTWAPVsStart,
+		"btc_1d":     CompareUpVsOpen,
+		"btc_above":  CompareAboveStrike,
+		"btc_hit":    CompareAnyHighAbove,
+		"btc_hit_1w": CompareAnyHighAbove,
 	}
 	for name, want := range cases {
 		spec, err := libs.LookupSeriesByName(name)

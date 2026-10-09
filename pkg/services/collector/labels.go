@@ -18,6 +18,7 @@ const (
 	CompareUpVsOpen     = "up_vs_open"           // close vs open of the interval candle
 	CompareTWAPVsStart  = "twap_vs_start"        // Chainlink TWAP vs range-start price
 	CompareAnyHighAbove = "any_high_at_or_above" // any 1m candle high in the ET day >= strike
+	CompareAnyLowBelow  = "any_low_at_or_below"  // any 1m candle low in the ET day <= strike
 )
 
 // StrikeRange is the ladder geometry parsed from a Gamma market's
@@ -106,6 +107,12 @@ func ComparisonFor(source string, r StrikeRange) string {
 	case SettleSourceBinanceCandle:
 		return CompareUpVsOpen
 	case SettleSourceBinance1mHigh:
+		// A hit ladder carries both directions: "↑ <n>" is a reach rung
+		// (settles on the 1m HIGH) and "↓ <n>" is a dip rung (settles on the
+		// 1m LOW). The rung's own bound says which one applies.
+		if r.RangeHigh != nil {
+			return CompareAnyLowBelow
+		}
 		return CompareAnyHighAbove
 	}
 	// Binance 1m close: up/down daily resolves on direction; ladders compare

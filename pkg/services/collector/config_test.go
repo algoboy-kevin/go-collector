@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/algoboy-kevin/go-collector/pkg/libs"
+	"github.com/algoboy-kevin/go-exchange-connector/pkg/polymarket"
 	"gopkg.in/yaml.v3"
 )
 
@@ -119,6 +120,7 @@ func TestShippedConfigsDecode(t *testing.T) {
 		Connector  yaml.Node       `yaml:"connector"`
 		Series     []SeriesConfig  `yaml:"series"`
 		Recording  RecordingConfig `yaml:"recording"`
+		Collector  HealthConfig    `yaml:"collector"`
 		RTDS       RTDSConfig      `yaml:"rtds"`
 		Binance    BinanceConfig   `yaml:"binance"`
 	}
@@ -177,5 +179,40 @@ func TestShippedConfigsDecode(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestShippedDailyConfigReadLimit pins the market-WS read limit the research
+// config ships. After ANY reconnect the connector re-subscribes the whole asset
+// set in one handshake and the server answers with a book snapshot per asset,
+// which overruns the 1 MiB default once the full ladder set is being recorded —
+// the oversized reply fails the read, closes the socket, and starts the
+// reconnect loop the read limit exists to prevent.
+func TestShippedDailyConfigReadLimit(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "collector_daily.yaml"))
+	if err != nil {
+		t.Skipf("config not readable from the test dir: %v", err)
+	}
+
+	var cfg struct {
+		DataDir    string            `yaml:"data_dir"`
+		RTDSDir    string            `yaml:"rtds_dir"`
+		BinanceDir string            `yaml:"binance_dir"`
+		Connector  polymarket.Config `yaml:"connector"`
+		Series     []SeriesConfig    `yaml:"series"`
+		Recording  RecordingConfig   `yaml:"recording"`
+		Collector  HealthConfig      `yaml:"collector"`
+		RTDS       RTDSConfig        `yaml:"rtds"`
+		Binance    BinanceConfig     `yaml:"binance"`
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	dec.KnownFields(true) // an unknown key is an error, not a silent no-op
+	if err := dec.Decode(&cfg); err != nil {
+		t.Fatalf("decode collector_daily.yaml: %v", err)
+	}
+
+	const want = int64(8 << 20) // 8 MiB
+	if cfg.Connector.ReadLimitBytes != want {
+		t.Errorf("connector.read_limit_bytes = %d, want %d", cfg.Connector.ReadLimitBytes, want)
 	}
 }

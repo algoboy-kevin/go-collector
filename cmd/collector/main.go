@@ -49,6 +49,7 @@ type Config struct {
 	Connector  polymarket.Config         `yaml:"connector"`
 	Series     []collector.SeriesConfig  `yaml:"series"`
 	Recording  collector.RecordingConfig `yaml:"recording"`
+	Collector  collector.HealthConfig    `yaml:"collector"`
 	RTDS       collector.RTDSConfig      `yaml:"rtds"`
 	Binance    collector.BinanceConfig   `yaml:"binance"`
 }
@@ -123,10 +124,10 @@ func main() {
 
 	// ── 4. Create EventCollector ──────────────────────
 	// Market recordings live under {dataDir}/market/<epoch>/.
-	ec := collector.NewCollector(collector.CollectorConfig{
+	ec := collector.NewCollector(cfg.Collector.Apply(collector.CollectorConfig{
 		RecordingDir: filepath.Join(dataDir, "market"),
 		EpochAnchor:  anchor,
-	}, conn)
+	}), conn)
 
 	conn.SetDispatcher(ec.HandleEvent)
 
@@ -332,7 +333,7 @@ func loadConfig(path string) (*Config, error) {
 			// only useful for basis.
 			Spot: collector.BinanceMarketConfig{
 				Symbols: []string{"BTCUSDT"},
-				Streams: []string{"aggTrade", "depth", "kline_5m"},
+				Streams: []string{"aggTrade", "depth", "kline_5m", "kline_1m"},
 			},
 		},
 	}
@@ -393,6 +394,14 @@ func subscribeBinanceStreams(bn *binance.WSBinance, ctx context.Context, mkt bin
 	if enabled("kline_5m", "kline", "klines") {
 		if err := bn.SubscribeKlines(ctx, mkt, []string{symbol}, "5m"); err != nil {
 			slog.Error("collector: failed to subscribe klines", "symbol", symbol, "err", err)
+		}
+	}
+	// Final 1m candles: the settlement candle itself for the hit-price family
+	// ("any 1m candle high >= strike"), so the outcome can be recomputed from
+	// the recorded candle rather than derived from aggTrade.
+	if enabled("kline_1m", "kline_1m_only") {
+		if err := bn.SubscribeKlines(ctx, mkt, []string{symbol}, "1m"); err != nil {
+			slog.Error("collector: failed to subscribe 1m klines", "symbol", symbol, "err", err)
 		}
 	}
 }

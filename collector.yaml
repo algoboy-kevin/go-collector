@@ -24,6 +24,11 @@ connector:
   user_ws_url:   "wss://ws-subscriptions-clob.polymarket.com/ws/user"
   reconnect_interval_ms: 500
   pending_flush_ms: 100
+  # 8 MiB per-message read limit: a reconnect handshake re-sends every subscribed
+  # asset at once and the server answers with one book snapshot per asset, which
+  # overruns the connector's 1 MiB default for a full ladder set. See
+  # collector_daily.yaml for the full rationale.
+  read_limit_bytes: 8388608
 
 # How long to record, and where the daily boundary sits.
 #
