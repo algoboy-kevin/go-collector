@@ -149,6 +149,11 @@ func main() {
 		}
 	})
 
+	// Let a new session seed its connection log with the WS state it was born
+	// into (a session created while the WS is already down counts that
+	// downtime), and give the silence watchdog a status source.
+	ec.SetMarketStatus(conn.MarketStatus)
+
 	// ── 4c. RTDS recording — Polymarket reference prices (~1/sec) ──
 	// Continuous per symbol; cut into hourly buckets (see FeedRecorder).
 	// Symbols with "/" are Chainlink feeds (e.g. "btc/usd"), all others are
@@ -243,6 +248,20 @@ func main() {
 	// Warns when a feed stops receiving events (silent WS death) and logs a
 	// periodic health summary so binance + RTDS are visible like the market.
 	ec.StartHealthMonitor(rt.RootContext(), 15*time.Second)
+
+	// ── 5c. Market-WS silence watchdog ──────────────────────
+	// The connector's ping/pong watchdog cannot see a socket that still
+	// answers pings but has stopped delivering events. If the WHOLE market
+	// feed goes silent for longer than the configured timeout while sessions
+	// are recording, force the market WS to reconnect. Wired to ReconnectMarket
+	// so RTDS/user sockets are untouched. Stops when the root context is
+	// cancelled.
+	ec.StartMarketWatchdog(rt.RootContext(), 10*time.Second, collector.MarketWatchdogDeps{
+		Now:            rt.Now,
+		Status:         conn.MarketStatus,
+		Reconnect:      conn.ReconnectMarket,
+		ActiveSessions: ec.ActiveSessions,
+	})
 
 	rt.Start()
 
