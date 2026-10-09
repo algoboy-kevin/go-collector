@@ -124,6 +124,12 @@ const (
 	ResolutionBasisOnchain       = "onchain"
 	ResolutionBasisCollapsedBook = "collapsed_book"
 	ResolutionBasisMidprice      = "midprice"
+	// ResolutionBasisGamma means the outcome came from the venue's published
+	// resolution, fetched through the connector's Gamma-backed GetResolution,
+	// rather than from the market WS resolution message or our own book. It is
+	// authoritative, but distinct from `onchain` so a reader can tell a
+	// pushed resolution event from a looked-up one.
+	ResolutionBasisGamma = "gamma"
 	// ResolutionBasisNoBook means a session recorded market data but never a
 	// single book snapshot, so there was nothing to decide the outcome from. It
 	// is NOT a NO win: the session is left unresolved.
@@ -462,10 +468,11 @@ func (mc MarketContext) Empty() bool {
 }
 
 // ResolutionFor returns the Resolution value for a raw on-chain outcome under
-// this context: "unsettled" when the run truncated the session, otherwise the
-// family-appropriate label (up/down vs yes/no).
+// this context: "unsettled" when the recording carries no outcome at all —
+// either the run truncated the session, or it settled without a decidable
+// resolution — otherwise the family-appropriate label (up/down vs yes/no).
 func (mc MarketContext) ResolutionFor(winningOutcome string) string {
-	if mc.Truncated {
+	if mc.Truncated || winningOutcome == "" {
 		return ResolutionUnsettled
 	}
 	family := ""
