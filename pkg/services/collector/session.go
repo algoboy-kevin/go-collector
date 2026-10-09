@@ -55,6 +55,22 @@ type RecordingSession struct {
 	lastYesBook []byte
 	lastNoBook  []byte
 
+	// lastBookAt is the received-at time (unix ms) of the most recent book
+	// snapshot for either side. A synthetic resolve only trusts a book that is
+	// still fresh at the settlement instant; 0 means no book was ever seen.
+	lastBookAt int64
+
+	// connEvents records the market-WS connection status changes received while
+	// this session was recording. Per-session stats are derived from it rather
+	// than from the collector's capped, run-wide log (which gave every market
+	// the same disconnect count).
+	connEvents []ConnectionEvent
+
+	// unresolvedBasis is the basis recorded when a synthetic resolve declined
+	// to decide an outcome (no data / no book / stale book). The session is
+	// left unsettled, but the reason it could not be decided is preserved.
+	unresolvedBasis string
+
 	// parent collector (for asset→market routing and finalize callback)
 	collector *EventCollector
 
@@ -223,19 +239,31 @@ func (s *RecordingSession) writeEventLocked(ev RecordedEvent) error {
 	s.prevTs = ev.Timestamp
 
 	// Keep the latest book snapshot per asset for synthetic midprice
-	// resolution (book_snapshot events are large; only the last one matters).
+	// resolution (book_snapshot events are large; only the last one matters),
+	// and remember when it arrived so a synthetic resolve can reject a book
+	// that had already gone stale by the settlement instant.
 	if ev.Type == "book_snapshot" {
 		var snap connector.BookSnapshotEvent
 		if err := json.Unmarshal(ev.Data, &snap); err == nil {
 			switch snap.AssetID {
 			case s.cfg.YesAssetID:
 				s.lastYesBook = append(s.lastYesBook[:0], ev.Data...)
+				s.noteBookAtLocked(ev.ReceivedAt)
 			case s.cfg.NoAssetID:
 				s.lastNoBook = append(s.lastNoBook[:0], ev.Data...)
+				s.noteBookAtLocked(ev.ReceivedAt)
 			}
 		}
 	}
 	return nil
+}
+
+// noteBookAtLocked records that a usable book snapshot arrived at `at` (unix
+// ms), keeping the latest. Caller holds s.mu.
+func (s *RecordingSession) noteBookAtLocked(at int64) {
+	if at > s.lastBookAt {
+		s.lastBookAt = at
+	}
 }
 
 // closeEventStream flushes/closes the events.gz file, classifies broker gaps
@@ -261,9 +289,13 @@ func (s *RecordingSession) closeEventStream() (*GapInfo, *ConnectionInfo, error)
 		return nil, nil, nil
 	}
 
-	var connEvents []ConnectionEvent
-	if s.collector != nil {
-		connEvents = filterConnectionEvents(s.collector.GetConnectionEvents(), s.cfg.MarketStartTime.UnixMilli(), 0)
+	// Per-session disconnect stats: the status callbacks that fell inside this
+	// session's own recording window, not the run-wide (capped) log — the cap
+	// gave every market the same disconnect count. An open-ended disconnect is
+	// closed at the finalize instant so its duration is counted, not lost.
+	connEvents := append([]ConnectionEvent(nil), s.connEvents...)
+	if n := len(connEvents); n > 0 && connEvents[n-1].Status == "disconnected" {
+		connEvents = append(connEvents, ConnectionEvent{Status: "connected", Timestamp: time.Now().UnixMilli()})
 	}
 	disconnectWindows := buildDisconnectWindows(connEvents)
 	connInfo := computeConnectionInfo(connEvents)
@@ -288,6 +320,25 @@ func (s *RecordingSession) closeEventStream() (*GapInfo, *ConnectionInfo, error)
 		}
 	}
 	return gi, connInfo, nil
+}
+
+// RecordConnection accumulates a market-WS connection status change that
+// occurred while this session was still recording. Thread-safe.
+//
+// Per-session rather than run-wide: the collector's connection log is capped
+// and shared by every market, so deriving a market's disconnect stats from it
+// gave them all the same truncated count. Only callbacks that arrive while the
+// session is RECORDING are kept, so the stats describe this market's window.
+func (s *RecordingSession) RecordConnection(status string, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != SessionRecording {
+		return
+	}
+	s.connEvents = append(s.connEvents, ConnectionEvent{
+		Status:    status,
+		Timestamp: at.UnixMilli(),
+	})
 }
 
 // EventCount returns the number of recorded events.  Thread-safe.
@@ -438,6 +489,7 @@ func (s *RecordingSession) Finalize() error {
 	}
 	s.state = SessionFinalized
 	mc := s.meta // snapshot under the lock: Truncated is set at shutdown
+	winning := s.winningOutcome
 	s.mu.Unlock()
 
 	// Close the streaming events.gz and finalize the gap/latency stats.
@@ -453,6 +505,26 @@ func (s *RecordingSession) Finalize() error {
 	if mc.Settlement != nil && mc.Settlement.At > 0 {
 		endTime = time.UnixMilli(mc.Settlement.At)
 	}
+
+	// Tail gap: how much of the window the feed actually covers. It only means
+	// something once the window has ended, so it is computed when the settlement
+	// instant is in the past. A recording whose last event predates settlement
+	// by more than the silence timeout is incomplete — flag it truncated. But
+	// never at the cost of a real outcome: a resolution that arrived is
+	// authoritative, and an early-resolved hit market legitimately stops trading
+	// long before its anchor.
+	if gi != nil && gi.EndTimestamp > 0 && endTime.Before(time.Now()) {
+		if tail := endTime.UnixMilli() - gi.EndTimestamp; tail > 0 {
+			gi.LastEventTs = gi.EndTimestamp
+			gi.TailGapMs = tail
+			if winning == "" {
+				if limit := s.marketSilenceMs(); limit > 0 && tail > limit {
+					mc.Truncated = true
+				}
+			}
+		}
+	}
+
 	meta := &MarketMetadata{
 		MarketID:         s.cfg.MarketID,
 		Slug:             s.cfg.Slug,
@@ -463,8 +535,8 @@ func (s *RecordingSession) Finalize() error {
 		EpochID:          mc.EpochID,
 		StartTime:        s.cfg.MarketStartTime.UnixMilli(),
 		EndTime:          endTime.UnixMilli(),
-		Resolution:       mc.ResolutionFor(s.winningOutcome),
-		WinningOutcome:   s.winningOutcome,
+		Resolution:       mc.ResolutionFor(winning),
+		WinningOutcome:   winning,
 		SyntheticResolve: s.resolvedSynthetically,
 		ResolutionBasis:  s.writeBasis(mc.Truncated),
 		Truncated:        mc.Truncated,
@@ -502,14 +574,34 @@ func (s *RecordingSession) Finalize() error {
 
 // ── Helpers ──────────────────────────────────────────────────
 
-// writeBasis is the ResolutionBasis to persist: the basis the resolution used,
-// or empty when there is no outcome to qualify (an unsettled, truncated session,
-// or one that was never resolved at all).
+// writeBasis is the ResolutionBasis to persist: the reason an attempted
+// synthetic resolve could not decide an outcome (no_data / no_book /
+// stale_book), the basis the resolution used, or empty when there is no outcome
+// and no recorded reason (an unsettled, run-truncated session).
 func (s *RecordingSession) writeBasis(truncated bool) string {
+	if s.unresolvedBasis != "" {
+		return s.unresolvedBasis
+	}
 	if truncated || s.winningOutcome == "" {
 		return ""
 	}
 	return s.resolveBasis
+}
+
+// marketSilenceMs is the configured tail-gap threshold in ms (0 = disabled).
+func (s *RecordingSession) marketSilenceMs() int64 {
+	if s.collector == nil {
+		return DefaultMarketSilenceTimeout.Milliseconds()
+	}
+	return s.collector.marketSilenceTimeout().Milliseconds()
+}
+
+// bookStaleMs is the configured book-staleness bound in ms (0 = disabled).
+func (s *RecordingSession) bookStaleMs() int64 {
+	if s.collector == nil {
+		return DefaultBookStaleAfter.Milliseconds()
+	}
+	return s.collector.bookStaleAfter().Milliseconds()
 }
 
 // eventType returns the type discriminator string for a raw event.
@@ -550,8 +642,15 @@ func eventAssetID(ev interface{}) string {
 	}
 }
 
-// handleSyntheticResolve computes a synthetic resolution based on the last
-// orderbook midprice and resolves the session.
+// handleSyntheticResolve decides a market whose resolution message never
+// reached us, from the last order book seen at the settlement instant.
+//
+// It never invents an outcome. With nothing recorded it leaves the session
+// unsettled (no_data); with market data but no book it leaves it unsettled
+// (no_book); and with a book that had already gone stale by settlement — a feed
+// that died hours earlier — it leaves it unsettled (stale_book). Only a book
+// still fresh at settlement may decide the outcome, and even then the
+// collapsed-book bounds are preferred over the 0.5-boundary guess.
 func (s *RecordingSession) handleSyntheticResolve() {
 	s.mu.Lock()
 	// Only apply synthetic resolve if still recording (not already resolved).
@@ -567,24 +666,41 @@ func (s *RecordingSession) handleSyntheticResolve() {
 		s.mu.Unlock()
 		return
 	}
-	// Mark as synthetic before computing midprice (under lock).
-	s.resolvedSynthetically = true
-	// Find the last book snapshot for midprice.
-	s.lastMidprice = s.computeLastMidprice()
+	count := s.count
+	lastBookAt := s.lastBookAt
+	settleAt := s.settleAtLocked()
 	s.mu.Unlock()
 
+	// Decide whether the book can be trusted at all, before reading it.
+	switch staleMs := s.bookStaleMs(); {
+	case count == 0:
+		s.declineResolution(ResolutionBasisNoData) // recorded nothing at all
+		return
+	case lastBookAt == 0:
+		s.declineResolution(ResolutionBasisNoBook) // market data, but never a book
+		return
+	case staleMs > 0 && settleAt.UnixMilli()-lastBookAt > staleMs:
+		s.declineResolution(ResolutionBasisStaleBook)
+		return
+	}
+
+	// The book is fresh: mark synthetic and read the midprice.
+	s.mu.Lock()
+	s.resolvedSynthetically = true
+	s.lastMidprice = s.computeLastMidprice()
 	lastMidprice := s.lastMidprice
+	s.mu.Unlock()
 
 	winningAssetID, basis := resolveFromMidprice(lastMidprice, s.cfg)
+	if winningAssetID == "" {
+		// A book was recorded but could not be parsed — same as none.
+		s.declineResolution(basis)
+		return
+	}
 
 	s.mu.Lock()
 	s.resolveBasis = basis
 	s.mu.Unlock()
-
-	if basis == ResolutionBasisNoBook {
-		slog.Warn("collector: synthetic resolve — no orderbook data, defaulting to NO",
-			"market", s.cfg.MarketID)
-	}
 
 	slog.Info("collector: synthetic resolve",
 		"market", s.cfg.MarketID,
@@ -597,6 +713,28 @@ func (s *RecordingSession) handleSyntheticResolve() {
 		slog.Error("collector: synthetic resolve failed", "market", s.cfg.MarketID, "err", err)
 		return
 	}
+
+	if err := s.Finalize(); err != nil {
+		slog.Error("collector: synthetic finalize failed", "market", s.cfg.MarketID, "err", err)
+	}
+}
+
+// declineResolution leaves a session unsettled — no winning outcome — while
+// recording the reason a synthetic resolve could not decide it. This replaces
+// the old behaviour that mapped "no book" to a NO win, which fabricated an
+// outcome for a market we simply had no data on.
+func (s *RecordingSession) declineResolution(basis string) {
+	s.mu.Lock()
+	s.unresolvedBasis = basis
+	s.meta.Truncated = true
+	if s.syntheticTimer != nil {
+		s.syntheticTimer.Stop()
+		s.syntheticTimer = nil
+	}
+	s.mu.Unlock()
+
+	slog.Warn("collector: synthetic resolve declined — leaving the market unsettled",
+		"market", s.cfg.MarketID, "basis", basis)
 
 	if err := s.Finalize(); err != nil {
 		slog.Error("collector: synthetic finalize failed", "market", s.cfg.MarketID, "err", err)
@@ -616,19 +754,20 @@ const (
 	collapsedBookNoMid  = 0.01
 )
 
-// resolveFromMidprice decides a market's outcome from the last midprice taken a
-// minute past the settlement instant, and reports how it decided.
+// resolveFromMidprice decides a market's outcome from a book that is still
+// fresh at the settlement instant, and reports how it decided.
 //
 // The collapsed-book bounds come first because they are evidence rather than a
 // guess: a book that has already gone one-sided *is* the resolution. A midprice
-// still between them means the book had not collapsed by the time we looked —
-// typically a book frozen since before settlement — so the outcome falls back to
-// the 0.5 boundary and is recorded as the weaker `midprice` basis, and a session
-// with no book at all (mid < 0) defaults to NO, recorded as `no_book`.
+// still between them means the book had not collapsed by the time we looked, so
+// the outcome falls back to the 0.5 boundary and is recorded as the weaker
+// `midprice` basis. A midprice below zero means there is no book to read at all
+// (mid < 0): no outcome and no basis beyond `no_book` are returned, and the
+// caller must leave the session unsettled rather than map it to a NO win.
 func resolveFromMidprice(mid float64, cfg SessionConfig) (winningAssetID, basis string) {
 	switch {
 	case mid < 0:
-		return cfg.NoAssetID, ResolutionBasisNoBook
+		return "", ResolutionBasisNoBook
 	case mid >= collapsedBookYesMid:
 		return cfg.YesAssetID, ResolutionBasisCollapsedBook
 	case mid <= collapsedBookNoMid:

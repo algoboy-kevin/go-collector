@@ -88,20 +88,67 @@ func (c *EventCollector) recordingDir() string {
 	return c.cfg.RecordingDir
 }
 
+// marketSilenceTimeout resolves the configured tail-gap threshold, applying the
+// default when unset and disabling the check when configured negative.
+func (c *EventCollector) marketSilenceTimeout() time.Duration {
+	switch {
+	case c.cfg.MarketSilenceTimeout < 0:
+		return 0
+	case c.cfg.MarketSilenceTimeout == 0:
+		return DefaultMarketSilenceTimeout
+	default:
+		return c.cfg.MarketSilenceTimeout
+	}
+}
+
+// bookStaleAfter resolves the configured book-staleness bound for synthetic
+// resolve, applying the default when unset and disabling the check when
+// configured negative.
+func (c *EventCollector) bookStaleAfter() time.Duration {
+	switch {
+	case c.cfg.BookStaleAfter < 0:
+		return 0
+	case c.cfg.BookStaleAfter == 0:
+		return DefaultBookStaleAfter
+	default:
+		return c.cfg.BookStaleAfter
+	}
+}
+
 // RecordConnectionEvent records a WebSocket connection status change.
+//
+// The global log is kept for debugging only. Each active session keeps its own
+// log (see RecordingSession.RecordConnection), because the global log is capped
+// and shared across the whole run: deriving per-market disconnect stats from it
+// gave every market the same capped count. The event is timestamped once and
+// handed to every active session with that instant, so a session's stats are
+// exactly the callbacks that fell inside its own recording window.
 func (c *EventCollector) RecordConnectionEvent(status string) {
+	now := time.Now()
+
 	c.connEventsMu.Lock()
-	defer c.connEventsMu.Unlock()
 	c.connEvents = append(c.connEvents, ConnectionEvent{
 		Status:    status,
-		Timestamp: time.Now().UnixMilli(),
+		Timestamp: now.UnixMilli(),
 	})
-	// Bound the log — finalized sessions have already written their stats, so
-	// only the recent tail is needed for per-market gap classification.
+	// Bound the debug log — finalized sessions keep their own stats, so only
+	// the recent tail is needed.
 	const maxConnEvents = 2048
 	if len(c.connEvents) > maxConnEvents {
 		c.connEvents = append([]ConnectionEvent(nil), c.connEvents[len(c.connEvents)-maxConnEvents:]...)
 	}
+	c.connEventsMu.Unlock()
+
+	c.mu.RLock()
+	sessions := make([]*RecordingSession, 0, len(c.sessions))
+	for _, s := range c.sessions {
+		sessions = append(sessions, s)
+	}
+	c.mu.RUnlock()
+	for _, s := range sessions {
+		s.RecordConnection(status, now)
+	}
+
 	slog.Debug("collector: connection event", "status", status)
 }
 

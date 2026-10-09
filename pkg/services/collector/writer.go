@@ -65,24 +65,6 @@ func computeConnectionInfo(connEvents []ConnectionEvent) *ConnectionInfo {
 	return ci
 }
 
-// filterConnectionEvents returns only connection events with Timestamp in
-// [startMs, endMs] (endMs 0 = unbounded). Used to scope per-market disconnect
-// stats and gap classification to that market's window instead of the full
-// cumulative connection log across market rotation.
-func filterConnectionEvents(connEvents []ConnectionEvent, startMs, endMs int64) []ConnectionEvent {
-	var out []ConnectionEvent
-	for _, e := range connEvents {
-		if e.Timestamp < startMs {
-			continue
-		}
-		if endMs != 0 && e.Timestamp > endMs {
-			continue
-		}
-		out = append(out, e)
-	}
-	return out
-}
-
 // writeJSONFile writes v as indented JSON to path, creating parent directories.
 // Used for the epoch manifest, which lives directly in the epoch directory
 // rather than in a sub-directory of its own.

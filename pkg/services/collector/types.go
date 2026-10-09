@@ -92,6 +92,14 @@ type GapInfo struct {
 	MaxLatencyMs        float64 `json:"max_latency_ms"`        // max latency
 	StartTimestamp      int64   `json:"start_timestamp"`       // first event broker ts
 	EndTimestamp        int64   `json:"end_timestamp"`         // last event broker ts
+	// LastEventTs mirrors EndTimestamp for readers that prefer an explicit name.
+	LastEventTs int64 `json:"last_event_ts,omitempty"`
+	// TailGapMs is end_time (the settlement instant) minus the last recorded
+	// event's broker timestamp — how much of the recording window the feed
+	// covers. A large value means the feed stopped delivering before the market
+	// settled, so the tail of the recording is missing and the session is
+	// flagged truncated.
+	TailGapMs int64 `json:"tail_gap_ms,omitempty"`
 }
 
 // Resolution values written to MarketMetadata.Resolution.
@@ -116,7 +124,18 @@ const (
 	ResolutionBasisOnchain       = "onchain"
 	ResolutionBasisCollapsedBook = "collapsed_book"
 	ResolutionBasisMidprice      = "midprice"
-	ResolutionBasisNoBook        = "no_book"
+	// ResolutionBasisNoBook means a session recorded market data but never a
+	// single book snapshot, so there was nothing to decide the outcome from. It
+	// is NOT a NO win: the session is left unresolved.
+	ResolutionBasisNoBook = "no_book"
+	// ResolutionBasisNoData means the session recorded nothing at all, so any
+	// outcome would be invented. The session is left unresolved.
+	ResolutionBasisNoData = "no_data"
+	// ResolutionBasisStaleBook means the last book snapshot was already too old
+	// at the settlement instant to reflect the market (e.g. the feed died hours
+	// before the market settled), so it was not used to decide the outcome. The
+	// session is left unresolved.
+	ResolutionBasisStaleBook = "stale_book"
 )
 
 // ResolutionLabel maps a raw on-chain winning outcome ("YES"/"NO") onto the
@@ -465,6 +484,50 @@ type CollectorConfig struct {
 	// the directory a market lands in, and the feed bucket a settlement can be
 	// recomputed from. Default: noon_et.
 	EpochAnchor libs.EpochAnchor
+
+	// BookStaleAfter is how old the last book snapshot may be, at the
+	// settlement instant, for a synthetic resolve to trust it. Older than this
+	// and the outcome is left unresolved rather than decided from a frozen
+	// book. Zero selects DefaultBookStaleAfter; negative disables the check.
+	BookStaleAfter time.Duration
+
+	// MarketSilenceTimeout is how long a market recording may go without any
+	// market-WS event before its tail is considered missing: a session whose
+	// last event is older than this at finalize is flagged truncated. Zero
+	// selects DefaultMarketSilenceTimeout; negative disables the check.
+	MarketSilenceTimeout time.Duration
+}
+
+// Defaults for the collector health knobs.
+const (
+	// DefaultBookStaleAfter is how stale a book may be at settlement and still
+	// be trusted for a synthetic resolve.
+	DefaultBookStaleAfter = 120 * time.Second
+	// DefaultMarketSilenceTimeout is how much of a recording window may be
+	// missing (end_time − last_event_ts) before the session is flagged
+	// truncated.
+	DefaultMarketSilenceTimeout = 60 * time.Second
+)
+
+// HealthConfig is the `collector:` block of collector.yaml: the timing knobs
+// that decide when a recording is considered incomplete. All values are
+// seconds; a negative value disables the corresponding check and 0 selects the
+// default.
+type HealthConfig struct {
+	// MarketSilenceTimeoutS is how much of a recording window may be missing
+	// (settlement − last event) before the session is flagged truncated.
+	MarketSilenceTimeoutS int `yaml:"market_silence_timeout_s"`
+	// BookStaleTimeoutS is how old the last book may be at settlement and still
+	// be trusted for a synthetic resolve.
+	BookStaleTimeoutS int `yaml:"book_stale_timeout_s"`
+}
+
+// CollectorConfig assembles a CollectorConfig from the health block, converting
+// seconds to durations.
+func (h HealthConfig) Apply(cfg CollectorConfig) CollectorConfig {
+	cfg.MarketSilenceTimeout = time.Duration(h.MarketSilenceTimeoutS) * time.Second
+	cfg.BookStaleAfter = time.Duration(h.BookStaleTimeoutS) * time.Second
+	return cfg
 }
 
 // SeriesConfig selects one market family to record, by its registry shorthand:
