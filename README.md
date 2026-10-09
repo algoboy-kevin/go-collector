@@ -84,6 +84,21 @@ go build -o bin/collector ./cmd/collector
 ./bin/collector -config collector.yaml -recording-dir ./data
 ```
 
+## Manual reconnect
+
+Force the market WebSocket to drop and re-dial without restarting the collector:
+
+```bash
+kill -USR1 <pid>     # pid of the running collector
+```
+
+SIGUSR1 is handled on its own channel, so it never triggers shutdown. Each
+accepted signal logs the current market-WS status at WARN and calls
+`ReconnectMarket()` — the same path the market-silence watchdog uses — so the
+reconnect/recovery behaviour can be exercised on a live run. Signals are
+rate-limited to at most one reconnect per 5 s (extras are logged and ignored),
+so a signal storm cannot flap the socket.
+
 ## Scripts: deploy / download / clear
 
 All three scripts **require** the server and SSH key as flags and fail fast if

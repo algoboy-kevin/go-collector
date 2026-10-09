@@ -278,6 +278,19 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
+	// ── 6b. Manual market-WS reconnect (SIGUSR1) ────────────
+	// A SEPARATE channel on purpose: SIGUSR1 forces the market WS to drop and
+	// re-dial so the recovery path can be exercised on a live run, and must
+	// never be treated as a shutdown signal. RunManualReconnect rate-limits it
+	// (at most one per 5s) so a signal storm cannot flap the socket. The
+	// goroutine exits with the root context and stops the signal delivery.
+	usr1Ch := make(chan os.Signal, 1)
+	signal.Notify(usr1Ch, syscall.SIGUSR1)
+	go func() {
+		defer signal.Stop(usr1Ch)
+		collector.RunManualReconnect(rt.RootContext(), usr1Ch, conn.ReconnectMarket, conn.MarketStatus, rt.Now)
+	}()
+
 	// There is deliberately no "all sessions finalized → exit" watcher here: the
 	// scheduler runs a rolling set of markets and legitimately has zero active
 	// sessions between windows. The run ends when `days` epochs have been
