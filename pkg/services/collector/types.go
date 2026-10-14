@@ -18,6 +18,7 @@ package collector
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -349,6 +350,34 @@ type MarketMetadata struct {
 	RawMarket   json.RawMessage `json:"raw_market,omitempty"`
 	DataQuality *GapInfo        `json:"data_quality,omitempty"`
 	Connections *ConnectionInfo `json:"connections,omitempty"`
+
+	// Coalescing describes the price_change coalescing this recording used.
+	// Nil (and therefore omitted) for a raw recording, so the existing schema
+	// is unchanged unless the feature is opted into.
+	Coalescing *CoalescingInfo `json:"coalescing,omitempty"`
+}
+
+// CoalescingInfo states the coalescing mode, its window, the compression it
+// chose, and the input-vs-emitted counts — so a reader can tell an aggregated
+// recording from a raw one, and see how much was folded away.
+type CoalescingInfo struct {
+	Enabled     bool   `json:"enabled"`
+	WindowMs    int64  `json:"window_ms"`
+	Compression string `json:"compression"` // "gzip6" when enabled
+
+	InputPriceChangeRecords int64 `json:"input_price_change_records"`
+	InputPriceChangeItems   int64 `json:"input_price_change_items"`
+	EmittedCoalescedRecords int64 `json:"emitted_coalesced_records"`
+	EmittedChangeItems      int64 `json:"emitted_change_items"`
+
+	// ReceiptRegressions counts raw inputs whose received_at went backwards;
+	// they are bucketed against the arrival watermark, never reordered.
+	ReceiptRegressions int64 `json:"receipt_regressions,omitempty"`
+	// MalformedFallbacks counts price_change records that were not valid
+	// decimals and were therefore persisted raw and unmodified.
+	MalformedFallbacks int64 `json:"malformed_fallbacks,omitempty"`
+	// WriteError records a sticky write failure that stopped acceptance.
+	WriteError string `json:"write_error,omitempty"`
 }
 
 // ── Epoch manifest ──────────────────────────────────────────
@@ -508,6 +537,13 @@ type CollectorConfig struct {
 	// last event is older than this at finalize is flagged truncated. Zero
 	// selects DefaultMarketSilenceTimeout; negative disables the check.
 	MarketSilenceTimeout time.Duration
+
+	// PriceChangeCoalesce is the fixed received_at window used to coalesce a
+	// market session's price_change records (opt-in). Zero keeps the existing
+	// raw behaviour: one persisted record per price_change, gzip.BestSpeed.
+	// Positive values are the window width (e.g. 100ms) and switch the session
+	// to gzip.DefaultCompression. See docs/operators/price-change-coalescing.md.
+	PriceChangeCoalesce time.Duration
 }
 
 // Defaults for the collector health knobs.
@@ -537,6 +573,32 @@ type HealthConfig struct {
 	// collector / no market-WS status source); with a status source wired,
 	// staleness is judged by disconnect/silence windows instead.
 	BookStaleTimeoutS int `yaml:"book_stale_timeout_s"`
+
+	// PriceChangeCoalesceMs opts into price_change coalescing for market
+	// sessions: a positive value is the fixed received_at window width in
+	// milliseconds (100 is the intended deployment setting; 250/1000 are also
+	// supported). Absent or 0 keeps the existing raw output exactly. A negative
+	// or time.Duration-overflowing value is rejected at startup, so merely
+	// upgrading the binary can never silently start discarding raw updates.
+	PriceChangeCoalesceMs int `yaml:"price_change_coalesce_ms"`
+}
+
+// maxPriceChangeCoalesceMs is the largest window that still converts to a
+// time.Duration without overflowing int64 nanoseconds.
+const maxPriceChangeCoalesceMs = int64(math.MaxInt64) / int64(time.Millisecond)
+
+// Validate rejects an unsupported coalescing setting before the collector opens
+// a socket. It reads h only.
+func (h HealthConfig) Validate() error {
+	ms := int64(h.PriceChangeCoalesceMs)
+	if ms < 0 {
+		return fmt.Errorf("collector.price_change_coalesce_ms: must not be negative (got %d)", ms)
+	}
+	if ms > maxPriceChangeCoalesceMs {
+		return fmt.Errorf("collector.price_change_coalesce_ms: %d ms overflows time.Duration (max %d)",
+			ms, maxPriceChangeCoalesceMs)
+	}
+	return nil
 }
 
 // CollectorConfig assembles a CollectorConfig from the health block, converting
@@ -544,6 +606,11 @@ type HealthConfig struct {
 func (h HealthConfig) Apply(cfg CollectorConfig) CollectorConfig {
 	cfg.MarketSilenceTimeout = time.Duration(h.MarketSilenceTimeoutS) * time.Second
 	cfg.BookStaleAfter = time.Duration(h.BookStaleTimeoutS) * time.Second
+	if h.PriceChangeCoalesceMs > 0 {
+		cfg.PriceChangeCoalesce = time.Duration(h.PriceChangeCoalesceMs) * time.Millisecond
+	} else {
+		cfg.PriceChangeCoalesce = 0
+	}
 	return cfg
 }
 

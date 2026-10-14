@@ -43,6 +43,20 @@ connector:
 #                            ladder event has a full pre-settlement history
 #
 # Boundaries are computed in America/New_York, so they follow DST.
+
+# Recording health and opt-in price_change coalescing.
+#
+# price_change_coalesce_ms: 0 or absent keeps the existing raw output exactly —
+# one persisted record per price_change, gzip.BestSpeed. A positive value is the
+# fixed received_at window in milliseconds and switches the session to gzip L6:
+#
+#   price_change_coalesce_ms: 100
+#
+# 100 is the intended setting (250/1000 are also supported). See
+# docs/operators/price-change-coalescing.md for the format and its trade-offs.
+collector:
+  price_change_coalesce_ms: 0
+
 recording:
   days: 3
   epoch: noon_et

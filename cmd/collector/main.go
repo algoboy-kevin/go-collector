@@ -383,6 +383,13 @@ func loadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
+	// Reject an invalid setting here, before the collector opens a socket: an
+	// unsupported coalescing window must be a loud startup failure, never a
+	// silently-ignored knob that discards data.
+	if err := cfg.Collector.Validate(); err != nil {
+		return nil, err
+	}
+
 	return cfg, nil
 }
 

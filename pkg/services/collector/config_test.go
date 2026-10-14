@@ -2,9 +2,11 @@ package collector
 
 import (
 	"bytes"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/algoboy-kevin/go-collector/pkg/libs"
 	"github.com/algoboy-kevin/go-exchange-connector/pkg/polymarket"
@@ -214,5 +216,64 @@ func TestShippedDailyConfigReadLimit(t *testing.T) {
 	const want = int64(8 << 20) // 8 MiB
 	if cfg.Connector.ReadLimitBytes != want {
 		t.Errorf("connector.read_limit_bytes = %d, want %d", cfg.Connector.ReadLimitBytes, want)
+	}
+}
+
+// TestPriceChangeCoalesceConfigValidation pins the opt-in coalescing setting:
+// absent/0 keeps the existing raw behaviour, a positive value is the window
+// width in milliseconds, and a negative or duration-overflowing value is
+// rejected at startup rather than silently discarded or wrapped.
+func TestPriceChangeCoalesceConfigValidation(t *testing.T) {
+	for _, ms := range []int{0, 100, 250, 1000} {
+		if err := (HealthConfig{PriceChangeCoalesceMs: ms}).Validate(); err != nil {
+			t.Errorf("PriceChangeCoalesceMs=%d should be valid, got %v", ms, err)
+		}
+	}
+	if err := (HealthConfig{PriceChangeCoalesceMs: -1}).Validate(); err == nil {
+		t.Error("a negative window must be rejected, not silently treated as raw")
+	}
+	if err := (HealthConfig{PriceChangeCoalesceMs: math.MaxInt}).Validate(); err == nil {
+		t.Error("a window that overflows time.Duration must be rejected")
+	}
+
+	// Apply carries the value into the collector config as a duration.
+	if got := (HealthConfig{PriceChangeCoalesceMs: 100}).Apply(CollectorConfig{}).PriceChangeCoalesce; got != 100*time.Millisecond {
+		t.Errorf("Apply(100) = %v, want 100ms", got)
+	}
+	if got := (HealthConfig{}).Apply(CollectorConfig{}).PriceChangeCoalesce; got != 0 {
+		t.Errorf("Apply(absurd) = %v, want 0 (raw)", got)
+	}
+}
+
+// TestShippedConfigsKeepCoalescingOff pins that the tracked configs ship the
+// coalescing window OFF: merely upgrading the binary must never start
+// aggregating data on its own, so enabling it stays an explicit edit.
+func TestShippedConfigsKeepCoalescingOff(t *testing.T) {
+	for _, name := range []string{"collector.yaml", "collector_daily.yaml"} {
+		t.Run(name, func(t *testing.T) {
+			raw, err := os.ReadFile(filepath.Join("..", "..", "..", name))
+			if err != nil {
+				t.Skipf("config not readable from the test dir: %v", err)
+			}
+			var cfg struct {
+				DataDir    string          `yaml:"data_dir"`
+				RTDSDir    string          `yaml:"rtds_dir"`
+				BinanceDir string          `yaml:"binance_dir"`
+				Connector  yaml.Node       `yaml:"connector"`
+				Series     []SeriesConfig  `yaml:"series"`
+				Recording  RecordingConfig `yaml:"recording"`
+				Collector  HealthConfig    `yaml:"collector"`
+				RTDS       RTDSConfig      `yaml:"rtds"`
+				Binance    BinanceConfig   `yaml:"binance"`
+			}
+			dec := yaml.NewDecoder(bytes.NewReader(raw))
+			dec.KnownFields(true) // the new key must exist in the schema
+			if err := dec.Decode(&cfg); err != nil {
+				t.Fatalf("decode %s: %v", name, err)
+			}
+			if cfg.Collector.PriceChangeCoalesceMs != 0 {
+				t.Errorf("%s: price_change_coalesce_ms = %d, want 0", name, cfg.Collector.PriceChangeCoalesceMs)
+			}
+		})
 	}
 }

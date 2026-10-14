@@ -68,6 +68,33 @@ type RecordingSession struct {
 	// price_change events refresh this, not just its snapshots.
 	lastBookAt int64
 
+	// ── price_change coalescing (opt-in; coalesceMs == 0 is raw) ──
+	//
+	// coalesceMs is the fixed received_at window width in ms, copied from the
+	// collector config at construction. Zero keeps the existing behaviour.
+	coalesceMs int64
+	// pending is the ONE current bucket, or nil.
+	pending *coalescePending
+	// coalesceTimer flushes a quiet feed at the bucket boundary; coalesceGen
+	// invalidates a callback that is already in flight so it can never flush a
+	// newer bucket.
+	coalesceTimer *time.Timer
+	coalesceGen   uint64
+	// newCoalesceTimer arms a timer; nil means time.AfterFunc. It exists so a
+	// test can capture and invoke a callback deterministically.
+	newCoalesceTimer func(time.Duration, func()) *time.Timer
+	// coalesceErr is sticky: the first write failure refuses further acceptance
+	// and is surfaced at finalization rather than silently dropping data.
+	coalesceErr   error
+	coalesceStats coalesceStats
+	// srcWatermark is the monotonic arrival watermark: the maximum received_at
+	// seen. Bucket assignment and cutoffs use it, so a regressing source clock
+	// can never reorder or split a window.
+	srcWatermark int64
+	// rawEvents counts accepted raw inputs (used by the synthetic-resolve
+	// no_data check, which must not depend on how many records were persisted).
+	rawEvents int64
+
 	// disconnectWindows are the session's market-WS down intervals, derived
 	// from connEvents at finalize. A tail that overlaps one is a real data
 	// loss; a tail on a healthy connection is just a quiet market.
@@ -124,6 +151,11 @@ func newRecordingSession(cfg SessionConfig, collector *EventCollector) *Recordin
 		startedAt: time.Now(),
 	}
 
+	// Price_change coalescing is a collector-level (opt-in) setting; 0 = raw.
+	if collector != nil && collector.cfg.PriceChangeCoalesce > 0 {
+		s.coalesceMs = collector.cfg.PriceChangeCoalesce.Milliseconds()
+	}
+
 	// Start synthetic resolve timer.
 	delay := cfg.SyntheticResolveAfter
 	if delay <= 0 {
@@ -166,14 +198,27 @@ func (s *RecordingSession) Record(ev RecordedEvent) bool {
 	if s.state != SessionRecording {
 		return false
 	}
+	// A sticky write failure stops acceptance: after a flush failed we must not
+	// keep accepting updates we cannot persist.
+	if s.coalesceMs > 0 && s.coalesceErr != nil {
+		return false
+	}
 
 	// Lazily open the per-market events.gz stream on the first event.
 	if err := s.ensureWriterLocked(); err != nil {
 		slog.Warn("collector: open event stream failed", "market", s.cfg.MarketID, "err", err)
 		return false
 	}
-	if err := s.writeEventLocked(ev); err != nil {
+
+	// Source-side effects (source counters, gap/latency stats, live BBO and
+	// book freshness) are applied to EVERY accepted raw input exactly once,
+	// before any aggregation. A coalesced tape, or a timer-generated timestamp,
+	// must never make freshness or data-loss look healthier, nor double-count.
+	s.observeRawLocked(ev)
+
+	if err := s.persistLocked(ev); err != nil {
 		slog.Warn("collector: write event failed", "market", s.cfg.MarketID, "err", err)
+		s.failLocked(err)
 		return false
 	}
 
@@ -206,7 +251,15 @@ func (s *RecordingSession) ensureWriterLocked() error {
 	if err != nil {
 		return fmt.Errorf("ensureWriter: create: %w", err)
 	}
-	gz, err := gzip.NewWriterLevel(f, gzip.BestSpeed)
+	// Compression level follows the mode: a raw capture keeps the historical
+	// gzip.BestSpeed, while a coalesced one uses gzip.DefaultCompression (L6),
+	// which is what the coalescing benchmark measured. (Recorded in
+	// metadata.json as coalescing.compression.)
+	level := gzip.BestSpeed
+	if s.coalesceMs > 0 {
+		level = gzip.DefaultCompression
+	}
+	gz, err := gzip.NewWriterLevel(f, level)
 	if err != nil {
 		_ = f.Close()
 		return fmt.Errorf("ensureWriter: gzip: %w", err)
@@ -218,15 +271,72 @@ func (s *RecordingSession) ensureWriterLocked() error {
 	return nil
 }
 
-// writeEventLocked encodes one event to the stream and updates the rolling
-// gap/latency stats (mirrors FeedRecorder.writeOne). Caller holds s.mu.
+// writeEventLocked encodes one record to the stream and assigns its monotonic
+// outer sequence number. Source statistics and the live top-of-book are NOT
+// updated here: they belong to observeRawLocked, which sees the raw inputs (a
+// coalesced record's synthetic timestamp must never feed them). Caller holds s.mu.
 func (s *RecordingSession) writeEventLocked(ev RecordedEvent) error {
-	// Assign a monotonic SeqID in arrival order.
+	// Assign a monotonic SeqID in output order.
 	ev.SeqID = s.count + 1
 	if err := s.enc.Encode(ev); err != nil {
 		return err
 	}
 	s.count++
+	return nil
+}
+
+// persistLocked writes an accepted event to the stream, folding price_change
+// records into the current coalescing bucket when coalescing is enabled.
+// Caller holds s.mu.
+func (s *RecordingSession) persistLocked(ev RecordedEvent) error {
+	if s.coalesceMs <= 0 {
+		return s.writeEventLocked(ev)
+	}
+	if ev.Type == "price_change" {
+		return s.coalescePriceChangeLocked(ev)
+	}
+	// Every other record is a control/snapshot boundary: an already-expired
+	// bucket is emitted at its OWN window end FIRST, then any still-open bucket
+	// is flushed early at the boundary record's own received_at. Either way no
+	// pending bucket can cross a snapshot or resolution, the tape keeps source
+	// order, and a stale bucket is not stretched forward to the control's time.
+	if err := s.expirePendingLocked(ev.ReceivedAt); err != nil {
+		return err
+	}
+	if err := s.flushPendingLocked(flushReasonForType(ev.Type), ev.ReceivedAt, false); err != nil {
+		return err
+	}
+	return s.writeEventLocked(ev)
+}
+
+// flushReasonForType maps a non-price_change record type to its flush reason.
+func flushReasonForType(typ string) string {
+	switch typ {
+	case "book_snapshot":
+		return flushReasonSnapshot
+	case "market_resolved":
+		return flushReasonResolve
+	default:
+		return flushReasonControl
+	}
+}
+
+// observeRawLocked applies the source-side effects of one accepted raw event:
+// source counters, the monotonic arrival watermark, broker-timestamp gap and
+// latency statistics, the live top-of-book, and book freshness. It runs for
+// EVERY raw input exactly once — independent of whether that input is persisted
+// verbatim or folded into a coalesced window — so aggregation and timer
+// timestamps can never inflate or mask these numbers. Caller holds s.mu.
+func (s *RecordingSession) observeRawLocked(ev RecordedEvent) {
+	s.rawEvents++
+	// Documented monotonic arrival watermark: a regressing source clock is
+	// counted, never sorted away.
+	if ev.ReceivedAt < s.srcWatermark {
+		s.coalesceStats.regressions++
+	} else {
+		s.srcWatermark = ev.ReceivedAt
+	}
+
 	if s.firstTs == 0 || ev.Timestamp < s.firstTs {
 		s.firstTs = ev.Timestamp
 	}
@@ -290,7 +400,6 @@ func (s *RecordingSession) writeEventLocked(ev RecordedEvent) error {
 			}
 		}
 	}
-	return nil
 }
 
 // noteBookAtLocked records that a usable book snapshot arrived at `at` (unix
@@ -308,6 +417,10 @@ func (s *RecordingSession) noteBookAtLocked(at int64) {
 func (s *RecordingSession) closeEventStream() (*GapInfo, *ConnectionInfo, [][2]int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// The stream is about to close: cancel the bucket timer and invalidate any
+	// callback already in flight so it cannot write after close.
+	s.stopCoalesceTimerLocked()
 
 	if s.gz != nil {
 		if err := s.gz.Close(); err != nil {
@@ -372,6 +485,23 @@ func (s *RecordingSession) RecordConnection(status string, at time.Time) {
 	defer s.mu.Unlock()
 	if s.state != SessionRecording {
 		return
+	}
+	// A connection transition is a boundary: a pending window must not straddle
+	// it. Expire an already-elapsed bucket at its own window end first, then
+	// flush any still-open bucket at the transition time, so the status entry
+	// and the tape stay in source order. Under the same s.mu as the append, so
+	// the flush cannot race a concurrent Record.
+	if s.coalesceMs > 0 {
+		now := at.UnixMilli()
+		if err := s.expirePendingLocked(now); err != nil {
+			slog.Error("collector: flushing the coalesced window on a connection transition failed",
+				"market", s.cfg.MarketID, "status", status, "err", err)
+			s.failLocked(err)
+		} else if err := s.flushPendingLocked(flushReasonConnection, now, false); err != nil {
+			slog.Error("collector: flushing the coalesced window on a connection transition failed",
+				"market", s.cfg.MarketID, "status", status, "err", err)
+			s.failLocked(err)
+		}
 	}
 	s.connEvents = append(s.connEvents, ConnectionEvent{
 		Status:    status,
@@ -507,6 +637,15 @@ func (s *RecordingSession) Resolve(winningAssetID string) error {
 		return nil // idempotent
 	}
 
+	// A resolution ends the market: flush the pending bucket at the resolve
+	// boundary so no accepted update can outlive it or cross into a later
+	// market state.
+	if err := s.flushPendingLocked(flushReasonResolve, 0, false); err != nil {
+		slog.Error("collector: flushing the coalesced window on resolve failed",
+			"market", s.cfg.MarketID, "err", err)
+		s.failLocked(err)
+	}
+
 	s.state = SessionResolved
 
 	// Stop the synthetic timer since we got a real resolution.
@@ -539,12 +678,31 @@ func (s *RecordingSession) Resolve(winningAssetID string) error {
 // Thread-safe.  Safe to call multiple times (idempotent after first).
 func (s *RecordingSession) Finalize() error {
 	s.mu.Lock()
-	// Idempotent: skip if already finalized.
+	// Idempotent: skip if already finalized. A sticky coalescing failure is NOT
+	// forgotten, though: a repeated Finalize must keep surfacing the same
+	// failure instead of reporting success the first call did not.
 	if s.state == SessionFinalized {
+		sticky := s.coalesceErr
 		s.mu.Unlock()
+		if sticky != nil {
+			return fmt.Errorf("finalize %s: coalesced write failed: %w", s.cfg.MarketID, sticky)
+		}
 		return nil
 	}
 	s.state = SessionFinalized
+
+	// Flush the pending coalescing bucket BEFORE the gzip stream is closed, so
+	// no accepted update is lost at resolution/shutdown. It is right-censored:
+	// the window was cut short by the close, not by its own boundary.
+	if err := s.flushPendingLocked(flushReasonFinalize, 0, true); err != nil {
+		slog.Error("collector: flushing the final coalesced window failed",
+			"market", s.cfg.MarketID, "err", err)
+		s.failLocked(err)
+	}
+	s.stopCoalesceTimerLocked()
+
+	coalesce := s.coalescingInfoLocked()
+	coalesceErr := s.coalesceErr
 	mc := s.meta // snapshot under the lock: Truncated is set at shutdown
 	winning := s.winningOutcome
 	s.mu.Unlock()
@@ -614,6 +772,7 @@ func (s *RecordingSession) Finalize() error {
 	}
 	meta.DataQuality = gi
 	meta.Connections = connInfo
+	meta.Coalescing = coalesce
 
 	// Write metadata.json under {recordingDir}/[{epoch}/]{marketID}/.
 	if err := writeMetadata(s.marketRoot(), s.cfg.MarketID, meta); err != nil {
@@ -629,6 +788,13 @@ func (s *RecordingSession) Finalize() error {
 	// Notify collector to unsubscribe from WS assets.
 	if s.onFinalized != nil {
 		s.onFinalized()
+	}
+
+	// Surface a sticky coalescing write failure: data was lost, so finalization
+	// must not report success. (The metadata was still written, with the failure
+	// recorded in its coalescing block.)
+	if coalesceErr != nil {
+		return fmt.Errorf("finalize %s: coalesced write failed: %w", s.cfg.MarketID, coalesceErr)
 	}
 
 	return nil
@@ -821,7 +987,9 @@ func (s *RecordingSession) handleSyntheticResolve() {
 		s.mu.Unlock()
 		return
 	}
-	count := s.count
+	// Accepted RAW input, not persisted-record count: a market whose only
+	// update is still pending in a coalescing bucket has been recorded.
+	acceptedInputs := s.rawEvents
 	lastBookAt := s.lastBookAt
 	settleAt := s.settleAtLocked()
 	// This session's own market-WS down intervals, with an open-ended disconnect
@@ -831,7 +999,7 @@ func (s *RecordingSession) handleSyntheticResolve() {
 
 	// Decide whether the book can be trusted at all, before reading it.
 	switch {
-	case count == 0:
+	case acceptedInputs == 0:
 		s.declineResolution(ResolutionBasisNoData) // recorded nothing at all
 		return
 	case lastBookAt == 0:

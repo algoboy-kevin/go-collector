@@ -50,6 +50,12 @@ connector:
 collector:
   market_silence_timeout_s: 60
   book_stale_timeout_s: 120
+  # Price_change coalescing (opt-in). 0 or absent keeps the existing raw output:
+  # one record per price_change, gzip.BestSpeed. A positive value is the fixed
+  # received_at window in milliseconds — 100 is the intended setting (250/1000
+  # are also supported) — and switches the session's events.gz to gzip L6.
+  #   price_change_coalesce_ms: 100
+  price_change_coalesce_ms: 0
 
 # How long to record, and where the daily boundary sits.
 #
