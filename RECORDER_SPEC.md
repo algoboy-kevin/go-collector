@@ -578,9 +578,18 @@ contract that each `l2Book` frame **is** the complete top-N book at its `rx_ns`.
 
 ### Fidelity ceiling (unchanged by any of this)
 
-The venue feed is a paced snapshot stream (~0.5 s or slower, §1 throttle warning); there is
-no full-depth source (the REST `l2Book` twin is also 20 levels). Queue position is inferred
-from level `n` and qty; the backtest must never present it as observed.
+The venue feed is a paced snapshot stream (~0.5 s or slower, §1 throttle warning); the
+public API caps depth at **20 levels/side on both WS and REST** (verified live 2026-10-21:
+`nLevels` is silently ignored by the WS, and `l4Book`/per-order data is schema-rejected —
+full-depth/L4 exists only via third-party infra). Queue position is inferred from level `n`
+and qty; the backtest must never present it as observed.
+
+**Queue-window rule.** An order placed at a price OUTSIDE the recorded top-N window has an
+*unknown* prior queue — it must never be modeled as joining an empty level (front of
+queue). Simulations may only claim queue position at levels inside the recorded window;
+placements beyond it are either prohibited by the strategy or penalized as hidden-queue.
+Any run that quotes outside the window is not "hftbacktest standard" regardless of how it
+was recorded.
 
 ## 8. Minimal Go sketch
 
