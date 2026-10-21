@@ -98,6 +98,14 @@ type RecorderConfig struct {
 
 	// FlapThreshold overrides DefaultFlapThreshold.
 	FlapThreshold int64
+
+	// AnchorDelay spaces the per-coin requests of a book-anchor round. Zero selects
+	// DefaultAnchorDelay.
+	AnchorDelay time.Duration
+
+	// AnchorTick replaces the periodic anchor ticker; tests drive it by hand. Nil uses a
+	// real ticker at book_anchors.interval_secs.
+	AnchorTick <-chan time.Time
 }
 
 // Recorder captures every frame the venue sends for the configured channels.
@@ -107,13 +115,17 @@ type RecorderConfig struct {
 // has to be a property of the connection, so each connection carries exactly one
 // channel and every frame arriving on it is that channel's.
 type Recorder struct {
-	cfg       *Config
-	opts      RecorderConfig
-	compress  int
-	plans     []ChannelPlan
-	conns     []*channelConn
-	sinks     map[hl.Channel]*Sink
-	startedAt time.Time
+	cfg      *Config
+	opts     RecorderConfig
+	compress int
+	plans    []ChannelPlan
+	conns    []*channelConn
+	sinks    map[hl.Channel]*Sink
+	// anchorSink and anchors exist only when book_anchors is enabled. They are kept out of
+	// plans/sinks on purpose: a plan is a WebSocket subscription, and this channel has none.
+	anchorSink *Sink
+	anchors    *bookAnchorer
+	startedAt  time.Time
 	// runID is the run's identity, stamped into every manifest and every `_meta` line.
 	runID string
 
@@ -133,6 +145,8 @@ type channelConn struct {
 	sink *Sink
 	ws   *hl.WSHyperliquid
 	plan ChannelPlan
+	// anchors, when non-nil, is asked for a fresh round after each reconnect.
+	anchors *bookAnchorer
 	// runID is the owning run's identity, stamped into this channel's sentinels.
 	runID string
 
@@ -233,6 +247,16 @@ func NewRecorder(opts RecorderConfig) (*Recorder, error) {
 			return nil, err
 		}
 		r.sinks[plan.Channel] = sink
+	}
+	if cfg.BookAnchors.Enabled {
+		sinkCfg := cfg.SinkConfigFor(BookAnchorsChannel, compression)
+		sinkCfg.RunID = r.runID
+		sink, err := NewSink(sinkCfg)
+		if err != nil {
+			r.closeSinks()
+			return nil, err
+		}
+		r.anchorSink = sink
 	}
 	return r, nil
 }
@@ -337,6 +361,11 @@ func (r *Recorder) Start(ctx context.Context) error {
 	m.CoinsSkipped = skipped
 	m.UniverseFingerprint = fingerprint
 	m.MetaSHA256 = dumps.MetaSHA256
+	if r.anchorSink != nil {
+		r.anchors = newBookAnchorer(r.opts.Info, r.anchorSink, anchorCoins(r.cfg.BookAnchors, coins),
+			r.cfg.BookAnchors.Interval(), r.opts.AnchorDelay, r.opts.Now, r.opts.AnchorTick)
+		m.BookAnchors = r.anchors.manifest(r.cfg.BookAnchors)
+	}
 	if err := WriteManifest(r.cfg.DataDir, m); err != nil {
 		return err
 	}
@@ -344,14 +373,21 @@ func (r *Recorder) Start(ctx context.Context) error {
 	r.manifest = m
 	r.mu.Unlock()
 
+	// Startup anchors go in before any connection exists, so they precede the first WS
+	// frames. A failure here is logged and skipped inside the round; it cannot fail Start.
+	if r.anchors != nil {
+		r.anchors.Start(ctx)
+	}
+
 	opts := r.cfg.Options()
 	for _, plan := range r.plans {
 		cc := &channelConn{
-			ch:    plan.Channel,
-			sink:  r.sinks[plan.Channel],
-			plan:  plan,
-			runID: r.runID,
-			sides: map[string]int64{},
+			anchors: r.anchors,
+			ch:      plan.Channel,
+			sink:    r.sinks[plan.Channel],
+			plan:    plan,
+			runID:   r.runID,
+			sides:   map[string]int64{},
 		}
 
 		// Each manager needs its own base: the dispatcher lives on the base, so a
@@ -692,6 +728,11 @@ func (r *Recorder) checkDisk() error {
 
 // writeError returns the first write-path failure across the channels.
 func (r *Recorder) writeError() error {
+	if r.anchorSink != nil {
+		if err := r.anchorSink.Err(); err != nil {
+			return fmt.Errorf("%s: %w", BookAnchorsChannel, err)
+		}
+	}
 	for _, cc := range r.conns {
 		if err := cc.sink.Err(); err != nil {
 			return fmt.Errorf("%s: %w", cc.ch, err)
@@ -714,6 +755,9 @@ func (r *Recorder) freeSpace() int64 {
 
 // stopConnections closes every connection. Nothing can enqueue a frame afterwards.
 func (r *Recorder) stopConnections() {
+	if r.anchors != nil {
+		r.anchors.Stop()
+	}
 	for _, cc := range r.conns {
 		cc.ws.Stop()
 	}
@@ -724,6 +768,11 @@ func (r *Recorder) stopConnections() {
 // rename.
 func (r *Recorder) closeSinks() error {
 	var first error
+	if r.anchorSink != nil {
+		if err := r.anchorSink.Stop(); err != nil {
+			first = fmt.Errorf("%s: %w", BookAnchorsChannel, err)
+		}
+	}
 	for _, plan := range r.plans {
 		sink, ok := r.sinks[plan.Channel]
 		if !ok {
@@ -779,6 +828,10 @@ func (r *Recorder) writeFinalManifest() {
 		m.Recording.FreeBytesAtEnd = v
 	}
 	m.ChannelReports = r.channelReports()
+	if r.anchors != nil {
+		m.BookAnchors = r.anchors.manifest(r.cfg.BookAnchors)
+		m.ChannelReports = append(m.ChannelReports, r.anchorReport())
+	}
 
 	if err := WriteManifest(r.cfg.DataDir, m); err != nil {
 		slog.Error("hyperliquid: rewrite manifest failed", "err", err)
@@ -807,31 +860,7 @@ func (r *Recorder) channelReports() []ChannelReport {
 			out = append(out, rep)
 			continue
 		}
-		rep.Frames = sink.Frames()
-		rep.Sentinels = sink.Sentinels()
-		rep.Drops = sink.Drops()
-		rep.DroppedSentinels = sink.DroppedSentinels()
-		rep.AfterStop = sink.AfterStop()
-		rep.WriteErrors = sink.WriteErrors()
-		rep.Bytes = sink.Bytes()
-		rep.FilesOpened = sink.FilesOpened()
-		rep.StaleFiles = sink.StaleFiles()
-		rep.ReplacedHours = sink.ReplacedHours()
-		rep.ClockRegressions = sink.ClockRegressions()
-		rep.ClockRegressionSamples = sink.ClockRegressionSamples()
-		rep.FramesWithNewline = sink.FramesContainingNewline()
-		rep.Files = sink.Files()
-		rep.Quarantined = sink.Quarantined()
-		if err := sink.Err(); err != nil {
-			rep.Error = err.Error()
-		}
-		if first := sink.FirstFrame(); !first.IsZero() {
-			rep.FirstFrameNS = first.UnixNano()
-		}
-		if last := sink.LastFrame(); !last.IsZero() {
-			rep.LastFrameNS = last.UnixNano()
-		}
-		rep.MaxGapMS = sink.MaxGap().Milliseconds()
+		fillSinkReport(&rep, sink)
 
 		if cc, ok := byChannel[plan.Channel]; ok {
 			rep.Acks = cc.acks.Load()
@@ -856,6 +885,44 @@ func (r *Recorder) channelReports() []ChannelReport {
 		out = append(out, rep)
 	}
 	return out
+}
+
+// fillSinkReport copies a sink's counters into its channel report.
+func fillSinkReport(rep *ChannelReport, sink *Sink) {
+	rep.Frames = sink.Frames()
+	rep.Sentinels = sink.Sentinels()
+	rep.Drops = sink.Drops()
+	rep.DroppedSentinels = sink.DroppedSentinels()
+	rep.AfterStop = sink.AfterStop()
+	rep.WriteErrors = sink.WriteErrors()
+	rep.Bytes = sink.Bytes()
+	rep.FilesOpened = sink.FilesOpened()
+	rep.StaleFiles = sink.StaleFiles()
+	rep.ReplacedHours = sink.ReplacedHours()
+	rep.ClockRegressions = sink.ClockRegressions()
+	rep.ClockRegressionSamples = sink.ClockRegressionSamples()
+	rep.FramesWithNewline = sink.FramesContainingNewline()
+	rep.Files = sink.Files()
+	rep.Quarantined = sink.Quarantined()
+	if err := sink.Err(); err != nil {
+		rep.Error = err.Error()
+	}
+	if first := sink.FirstFrame(); !first.IsZero() {
+		rep.FirstFrameNS = first.UnixNano()
+	}
+	if last := sink.LastFrame(); !last.IsZero() {
+		rep.LastFrameNS = last.UnixNano()
+	}
+	rep.MaxGapMS = sink.MaxGap().Milliseconds()
+}
+
+// anchorReport is the bookAnchors entry in channel_reports: the sink's own accounting
+// (count, first/last ts, bytes, files) plus the largest body fetched.
+func (r *Recorder) anchorReport() ChannelReport {
+	rep := ChannelReport{Channel: BookAnchorsChannel}
+	fillSinkReport(&rep, r.anchorSink)
+	rep.LargestFrame = r.anchors.largest.Load()
+	return rep
 }
 
 func (r *Recorder) setStop(reason string, err error) {
@@ -945,6 +1012,9 @@ func (c *channelConn) onStatus(st ws.ConnectionStatus) {
 	switch st {
 	case ws.StatusConnected:
 		if n := c.connects.Add(1); n > 1 {
+			if c.anchors != nil {
+				c.anchors.Request(AnchorReconnect)
+			}
 			// A reconnect. Counted until a frame arrives, so the flap detector can tell
 			// "this connection is being refused" from "this market is quiet".
 			c.connectsSinceProgress.Add(1)

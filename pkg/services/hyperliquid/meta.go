@@ -179,6 +179,10 @@ type Manifest struct {
 
 	Recording RecordingManifest `json:"recording"`
 
+	// BookAnchors describes the anchor dumper. Absent when anchors are off, so a run
+	// without them has a manifest identical to one from before the feature existed.
+	BookAnchors *BookAnchorsManifest `json:"book_anchors,omitempty"`
+
 	// StopReason is "signal", "duration", "disk_low", "write_error" or "channel_stopped".
 	StopReason string `json:"stop_reason,omitempty"`
 

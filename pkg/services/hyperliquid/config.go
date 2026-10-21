@@ -82,6 +82,35 @@ type Config struct {
 	L2Book    L2BookConfig    `yaml:"l2Book"`
 	Connector ConnectorConfig `yaml:"connector"`
 	Recording RecordingConfig `yaml:"recording"`
+
+	// BookAnchors enables REST l2Book anchor snapshots. Absent or enabled=false is off,
+	// and off changes nothing in the capture or the manifest.
+	BookAnchors BookAnchorsConfig `yaml:"book_anchors"`
+}
+
+// BookAnchorsConfig configures the book-anchor dumper (bookanchors.go).
+//
+// An anchor is one REST `{"type":"l2Book","coin":"<coin>"}` response, recorded verbatim
+// into the `bookAnchors` channel. The venue caps that response at 20 levels per side, so
+// anchors do NOT extend depth: they are independent point-in-time book states to
+// cross-check the paced WebSocket frames against, and snapshot artifacts for a
+// converter.
+type BookAnchorsConfig struct {
+	// Enabled turns the dumper on. Off by default.
+	Enabled bool `yaml:"enabled"`
+
+	// IntervalSecs is the periodic cadence in seconds. 0 means anchors are taken at
+	// startup and on reconnect only. Negative is an error.
+	IntervalSecs int `yaml:"interval_secs"`
+
+	// Coins optionally narrows the anchored coins to a subset of the top-level `coins`.
+	// Absent or empty anchors every recorded coin.
+	Coins []string `yaml:"coins"`
+}
+
+// Interval returns the periodic cadence, or 0 when there is none.
+func (b BookAnchorsConfig) Interval() time.Duration {
+	return time.Duration(b.IntervalSecs) * time.Second
 }
 
 // L2BookConfig carries the optional l2Book thinning parameters.
@@ -271,6 +300,35 @@ func (c *Config) Validate() error {
 	if c.Recording.MinFreeBytes != nil && *c.Recording.MinFreeBytes < 0 {
 		errs = append(errs, fmt.Errorf("recording.min_free_bytes: got %d, want >= 0 (0 disables the guard)",
 			*c.Recording.MinFreeBytes))
+	}
+
+	// Book anchors. Only checked when enabled, so a dormant block cannot fail a run.
+	if c.BookAnchors.Enabled {
+		if c.BookAnchors.IntervalSecs < 0 {
+			errs = append(errs, fmt.Errorf("book_anchors.interval_secs: got %d, want >= 0 (0 = at-connect only)",
+				c.BookAnchors.IntervalSecs))
+		}
+		configured := map[string]bool{}
+		for _, coin := range c.Coins {
+			configured[coin] = true
+		}
+		anchored := map[string]bool{}
+		for i, raw := range c.BookAnchors.Coins {
+			coin, err := hl.NormalizeCoin(raw)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("book_anchors.coins[%d]: %w", i, err))
+				continue
+			}
+			if anchored[coin] {
+				errs = append(errs, fmt.Errorf("book_anchors.coins[%d]: duplicate coin %q", i, coin))
+				continue
+			}
+			anchored[coin] = true
+			if !configured[coin] {
+				errs = append(errs, fmt.Errorf("book_anchors.coins[%d]: %q is not in `coins`", i, coin))
+			}
+			c.BookAnchors.Coins[i] = coin
+		}
 	}
 
 	// Finally, let the connector validate the subscriptions themselves. This is the

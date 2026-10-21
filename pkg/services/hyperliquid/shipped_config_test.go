@@ -55,8 +55,12 @@ func TestShippedConfigDecodes(t *testing.T) {
 			t.Error("the shipped config must not record candles")
 		}
 	}
-	if !cfg.L2Book.Fast {
-		t.Error("l2Book.fast should be on: it halves the largest channel")
+	// The shipped config follows RECORDER_SPEC §7b: fast:false is the backtest/dataset
+	// standard (20 levels, and measured ~2.8x FEWER bytes/s than fast:true — the feed is
+	// paced by depth). fast:true is the cadence-first mode and is chosen per run, not
+	// shipped as the dataset default.
+	if cfg.L2Book.Fast {
+		t.Error("l2Book.fast should be off in the shipped config: §7b depth standard")
 	}
 	if cfg.L2Book.NSigFigs != 0 || cfg.L2Book.Mantissa != 0 {
 		t.Error("nSigFigs/mantissa must stay unset: they thin prices, not just levels")
