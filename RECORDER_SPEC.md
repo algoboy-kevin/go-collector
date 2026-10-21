@@ -545,6 +545,28 @@ level below one lot is removed), and only `DEPTH_CLEAR_EVENT` resets state. Snap
 are therefore NOT special to the engine — what makes a state authoritative is the producer's
 contract that each `l2Book` frame **is** the complete top-N book at its `rx_ns`.
 
+### Capture pattern (the general architecture)
+
+**Snapshot first, stream after.** A backtest-grade capture is anchored by a full-depth
+snapshot at connection start (and re-anchored periodically), then continued by the venue's
+depth stream. Two fidelity classes, classified per venue — the classifier is the venue's
+capability, never the recorder's choice:
+
+| Class | Venue gives | Anchors | Queue claims valid |
+|---|---|---|---|
+| `full-anchored` | full book (initial snapshot + diffs, or per-order/L4) | full snapshot at connect + periodic | anywhere in the recorded book |
+| `windowed-N` | top-N snapshots only (N = 20 for Hyperliquid, `fast:false`) | best-available snapshot (top-N) at connect + periodic (`bookAnchors`) | **only inside the top-N window** (queue-window rule below) |
+
+Hyperliquid is the canonical `windowed-N` venue: its public API caps depth at 20/side on
+both WS and REST (verified live 2026-10-21; `nLevels` is silently ignored, `l4Book` is
+schema-rejected — full depth exists only via third-party infra). Any future broker that
+cannot produce a full book lands in the same class. The recorder's job is to capture the
+best the venue offers at anchor times (`book_anchors`, §7b contract below) and to record the
+class in the run manifest (`l2book_params` + channel reports identify it); the converter
+stamps `book_fidelity` into the dataset manifest, and the SIM must gate queue claims on it —
+see the queue-window rule. A simulation that treats `windowed-N` data as `full-anchored` is
+not "hftbacktest standard" no matter how it was recorded.
+
 ### Contract
 
 1. **Per-frame snapshot property.** Every `l2Book` frame is an authoritative top-N snapshot
