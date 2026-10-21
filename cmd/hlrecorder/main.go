@@ -14,6 +14,7 @@
 //	hlrecorder -config collector_hl.yaml
 //	hlrecorder -config collector_hl.yaml -dry-run          # validate + print, no network
 //	hlrecorder -config collector_hl.yaml -duration 1h      # a one-hour capture
+//	hlrecorder -config collector_hl.yaml -coins BTC,ETH    # replaces the config's coins
 //
 // Exit codes: 0 for a run ended by a signal or -duration, 1 for a run that failed or
 // stopped early (low disk, write error, startup failure), 2 for bad usage or config.
@@ -49,6 +50,7 @@ func run() int {
 	duration := flag.Duration("duration", 0, "stop after this long (0 runs until signalled)")
 	dryRun := flag.Bool("dry-run", false, "validate the config and print the plan, without connecting")
 	logLevel := flag.String("log", "info", "log level: debug, info, warn, error")
+	coinsFlag := flag.String("coins", "", "comma-separated venue symbols replacing coins from the config, e.g. BTC,ETH,xyz:JP225")
 	flag.Parse()
 
 	if err := setupLogging(*logLevel); err != nil {
@@ -63,6 +65,10 @@ func run() int {
 	}
 	if *dataDir != "" {
 		cfg.DataDir = *dataDir
+	}
+	if err := applyCoins(cfg, *coinsFlag); err != nil {
+		fmt.Fprintf(os.Stderr, "hlrecorder: %v\n", err)
+		return 2
 	}
 
 	if *dryRun {
