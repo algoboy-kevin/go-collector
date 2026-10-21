@@ -575,6 +575,13 @@ not "hftbacktest standard" no matter how it was recorded.
    out-of-window-below/above — a level leaving the top-N window is not a book deletion. The
    never-parse rule is what preserves this property; any future parser that aggregates,
    coalesces or drops frames breaks §7b.
+   *Emission convention (locked 2026-10-21):* the npz carries one set-to-qty row per present
+   level **plus one removal row (qty 0, same side, frame clocks) per vanished level** — the
+   engine book mirrors the recorded window exactly and never holds phantom depth. Each
+   removal row's `ival` parks the `DiffOrderBookSnapshot` classification (`0`
+   IN_THE_BOOK_DELETION, `1` OUT_OF_BOOK_DELETION_BELOW, `2` OUT_OF_BOOK_DELETION_ABOVE),
+   so "not a book deletion" stays true at the data level: the sim's queue-window rule reads
+   these labels and treats out-of-window prices as hidden-queue, never front-of-queue.
 2. **Depth standard.** Backtest-grade captures record `fast:false` (20 levels). `fast:true`
    is a valid cadence-first mode (~1.84/s vs ~0.19/s) but the run's `l2book_params` in the
    manifest must record it, and downstream findings carry the reduced-depth flag. Never set
